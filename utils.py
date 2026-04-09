@@ -77,3 +77,14 @@ def execute_query(db_config: dict, query: str) -> dict[str, Any]:
                 "affected_rows": affected_rows,
                 "status_message": status_message,
             }
+
+def execute_etl_query(query: str, params=None, fetch=False):
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                if fetch:
+                    return cur.fetchall()
+    finally:
+        conn.close()

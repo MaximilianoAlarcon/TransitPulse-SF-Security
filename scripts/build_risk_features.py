@@ -1,4 +1,4 @@
-from utils import execute_query
+from utils import execute_etl_query
 
 SQL = """
 TRUNCATE TABLE risk_features_hourly;
@@ -90,4 +90,4 @@ GROUP BY 1,2,3,4,5,6;
 """
 
 if __name__ == "__main__":
-    execute_query(SQL)
+    execute_etl_query(SQL)

@@ -1,5 +1,5 @@
 import requests
-from utils import get_connection
+from utils import get_db_connection
 
 API_URL = "https://data.sfgov.org/resource/wg3w-h783.json?$limit=1000"
 
@@ -85,7 +85,7 @@ def load_incidents():
         report_delay_minutes = EXCLUDED.report_delay_minutes;
     """
 
-    conn = get_connection()
+    conn = get_db_connection()
     try:
         with conn:
             with conn.cursor() as cur:

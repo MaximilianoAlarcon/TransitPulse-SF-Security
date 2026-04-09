@@ -1,4 +1,4 @@
-from utils import execute_query
+from utils import execute_etl_query
 
 SQL = """
 TRUNCATE TABLE incident_counts_daily;
@@ -26,4 +26,4 @@ GROUP BY 1,2,3,4;
 """
 
 if __name__ == "__main__":
-    execute_query(SQL)
+    execute_etl_query(SQL)
