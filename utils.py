@@ -17,6 +17,13 @@ def validate_db_config(db_config: dict) -> None:
             f"Missing database environment variables: {', '.join(missing)}"
         )
 
+def _serialize_cell(value: Any) -> Any:
+    if hasattr(value, "isoformat"):
+        try:
+            return value.isoformat()
+        except Exception:
+            return str(value)
+    return value
 
 def get_db_connection(db_config: dict):
     validate_db_config(db_config)

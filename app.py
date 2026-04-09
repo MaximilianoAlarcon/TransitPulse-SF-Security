@@ -154,7 +154,31 @@ def db_query():
         return jsonify({"status": "error", "message": str(exc), "query": query}), 500
 
 
+@app.route("/drop-legacy-otp-tables", methods=["POST"])
+def drop_legacy_otp_tables():
+    query = """
+    DROP TABLE IF EXISTS connections CASCADE;
+    DROP TABLE IF EXISTS routes CASCADE;
+    DROP TABLE IF EXISTS shapes CASCADE;
+    DROP TABLE IF EXISTS stop_times CASCADE;
+    DROP TABLE IF EXISTS stops CASCADE;
+    DROP TABLE IF EXISTS trips CASCADE;
+    """
 
+    try:
+        result = execute_query(DB_CONFIG, query)
+        return jsonify(
+            {
+                "status": "ok",
+                "message": "Legacy OTP tables were dropped if they existed.",
+                "query": query,
+                "result_type": "command",
+                "affected_rows": result.get("affected_rows"),
+                "status_message": result.get("status_message"),
+            }
+        )
+    except Exception as exc:
+        return jsonify({"status": "error", "message": str(exc), "query": query}), 500
 
 
 if __name__ == "__main__":
