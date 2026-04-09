@@ -3,6 +3,14 @@ import psycopg2
 from typing import Any
 from psycopg2 import sql
 
+DB_CONFIG = {
+    "host": os.environ.get("DB_HOST"),
+    "database": os.environ.get("DB_NAME"),
+    "user": os.environ.get("DB_USER"),
+    "password": os.environ.get("DB_PASSWORD"),
+    "port": os.environ.get("DB_PORT")
+}
+
 class DatabaseConfigError(ValueError):
     pass
 
@@ -25,14 +33,13 @@ def _serialize_cell(value: Any) -> Any:
             return str(value)
     return value
 
-def get_db_connection(db_config: dict):
-    validate_db_config(db_config)
+def get_db_connection():
     return psycopg2.connect(
-        host=db_config["host"],
-        dbname=db_config["database"],
-        user=db_config["user"],
-        password=db_config["password"],
-        port=db_config["port"],
+        host=DB_CONFIG["host"],
+        dbname=DB_CONFIG["database"],
+        user=DB_CONFIG["user"],
+        password=DB_CONFIG["password"],
+        port=DB_CONFIG["port"],
     )
 
 
