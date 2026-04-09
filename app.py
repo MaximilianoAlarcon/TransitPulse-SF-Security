@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template_string
+from flask import Flask, jsonify, render_template
 from psycopg2 import sql
 import psycopg2
 
