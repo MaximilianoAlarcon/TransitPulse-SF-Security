@@ -51,7 +51,7 @@ def execute_sql_file(db_config: dict, sql_path: Path) -> None:
 
     sql_content = sql_path.read_text(encoding="utf-8")
 
-    with get_db_connection(db_config) as conn:
+    with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(sql_content)
         conn.commit()
@@ -61,7 +61,7 @@ def execute_query(db_config: dict, query: str) -> dict[str, Any]:
     if not cleaned_query:
         raise ValueError("Query cannot be empty")
 
-    with get_db_connection(db_config) as conn:
+    with get_db_connection() as conn:
         with conn.cursor() as cur:
             cur.execute(cleaned_query)
 
