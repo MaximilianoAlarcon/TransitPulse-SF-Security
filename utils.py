@@ -2,6 +2,7 @@ from pathlib import Path
 import psycopg2
 from typing import Any
 from psycopg2 import sql
+import os
 
 DB_CONFIG = {
     "host": os.environ.get("DB_HOST"),
