@@ -1,7 +1,7 @@
 from pathlib import Path
-
 import psycopg2
-
+from typing import Any
+from psycopg2 import sql
 
 class DatabaseConfigError(ValueError):
     pass
