@@ -1,11 +1,11 @@
 import os
 from pathlib import Path
 
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template, request
 from psycopg2 import sql
 import psycopg2
 
-from utils import get_db_connection, execute_sql_file
+from utils import get_db_connection, execute_sql_file, execute_query
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -112,6 +112,49 @@ def db_tables():
         )
     except Exception as exc:
         return jsonify({"status": "error", "message": str(exc)}), 500
+
+
+
+@app.route("/db-query", methods=["POST"])
+def db_query():
+    payload = request.get_json(silent=True) or {}
+    query = payload.get("query", "")
+    output_format = (payload.get("format") or "json").lower()
+    title = payload.get("title") or "Query Result"
+
+    try:
+        result = execute_query(DB_CONFIG, query)
+
+        if result["has_result_set"]:
+            if output_format == "html":
+                return render_html_table(result["columns"], result["rows"], title=title)
+
+            return jsonify(
+                {
+                    "status": "ok",
+                    "query": query,
+                    "result_type": "result_set",
+                    "columns": result["columns"],
+                    "rows": result["rows"],
+                    "row_count": result["row_count"],
+                    "status_message": result["status_message"],
+                }
+            )
+
+        return jsonify(
+            {
+                "status": "ok",
+                "query": query,
+                "result_type": "command",
+                "affected_rows": result["affected_rows"],
+                "status_message": result["status_message"],
+            }
+        )
+    except Exception as exc:
+        return jsonify({"status": "error", "message": str(exc), "query": query}), 500
+
+
+
 
 
 if __name__ == "__main__":
