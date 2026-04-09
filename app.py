@@ -32,7 +32,7 @@ def health():
 @app.route("/db-test")
 def db_test():
     try:
-        with get_db_connection(DB_CONFIG) as conn:
+        with get_db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT current_database(), version();")
                 database_name, version = cur.fetchone()
@@ -87,7 +87,7 @@ def db_tables():
     """
 
     try:
-        with get_db_connection(DB_CONFIG) as conn:
+        with get_db_connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(query)
                 rows = cur.fetchall()
