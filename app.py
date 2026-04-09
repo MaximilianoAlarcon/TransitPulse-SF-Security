@@ -69,6 +69,51 @@ def init_db():
         return jsonify({"status": "error", "message": str(exc)}), 500
 
 
+@app.route("/db-tables")
+def db_tables():
+    query = """
+        SELECT
+            t.table_schema,
+            t.table_name,
+            COALESCE(s.n_live_tup::bigint, 0) AS estimated_rows,
+            obj_description((quote_ident(t.table_schema) || '.' || quote_ident(t.table_name))::regclass, 'pg_class') AS table_comment
+        FROM information_schema.tables AS t
+        LEFT JOIN pg_stat_user_tables AS s
+            ON s.schemaname = t.table_schema
+           AND s.relname = t.table_name
+        WHERE t.table_type = 'BASE TABLE'
+          AND t.table_schema NOT IN ('pg_catalog', 'information_schema')
+        ORDER BY t.table_schema, t.table_name;
+    """
+
+    try:
+        with get_db_connection(DB_CONFIG) as conn:
+            with conn.cursor() as cur:
+                cur.execute(query)
+                rows = cur.fetchall()
+
+        tables = [
+            {
+                "schema": row[0],
+                "table_name": row[1],
+                "estimated_rows": row[2],
+                "comment": row[3],
+            }
+            for row in rows
+        ]
+
+        return jsonify(
+            {
+                "status": "ok",
+                "database": DB_CONFIG.get("database"),
+                "total_tables": len(tables),
+                "tables": tables,
+            }
+        )
+    except Exception as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 500
+
+
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port, debug=True)
