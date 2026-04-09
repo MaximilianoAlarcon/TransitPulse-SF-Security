@@ -8,7 +8,10 @@ if PROJECT_ROOT not in sys.path:
 from utils import execute_etl_query
 
 SQL = """
-TRUNCATE TABLE forecast_training_series;
+BEGIN;
+
+DELETE FROM forecast_training_series
+WHERE bucket_start >= date_trunc('hour', NOW() - INTERVAL '48 hours');
 
 INSERT INTO forecast_training_series (
     series_id,
@@ -24,7 +27,10 @@ SELECT
     incident_category,
     SUM(total_incidents) AS total_incidents
 FROM incident_counts_hourly
+WHERE bucket_start >= date_trunc('hour', NOW() - INTERVAL '48 hours')
 GROUP BY 1,2,3,4;
+
+COMMIT;
 """
 
 if __name__ == "__main__":

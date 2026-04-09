@@ -8,7 +8,10 @@ if PROJECT_ROOT not in sys.path:
 from utils import execute_etl_query
 
 SQL = """
-TRUNCATE TABLE incident_counts_daily;
+BEGIN;
+
+DELETE FROM incident_counts_daily
+WHERE bucket_date >= CURRENT_DATE - INTERVAL '7 days';
 
 INSERT INTO incident_counts_daily (
     bucket_date,
@@ -21,15 +24,18 @@ INSERT INTO incident_counts_daily (
 )
 SELECT
     incident_date AS bucket_date,
-    COALESCE(police_district, 'Unknown'),
-    COALESCE(incident_category, 'Unknown'),
-    COALESCE(incident_subcategory, 'Unknown'),
-    COUNT(*),
-    COUNT(*) FILTER (WHERE resolution = 'Open or Active'),
-    COUNT(*) FILTER (WHERE filed_online = true)
+    COALESCE(police_district, 'Unknown') AS police_district,
+    COALESCE(incident_category, 'Unknown') AS incident_category,
+    COALESCE(incident_subcategory, 'Unknown') AS incident_subcategory,
+    COUNT(*) AS total_incidents,
+    COUNT(*) FILTER (WHERE resolution = 'Open or Active') AS open_active_count,
+    COUNT(*) FILTER (WHERE filed_online = true) AS filed_online_count
 FROM incidents_raw
 WHERE incident_date IS NOT NULL
+  AND incident_date >= CURRENT_DATE - INTERVAL '7 days'
 GROUP BY 1,2,3,4;
+
+COMMIT;
 """
 
 if __name__ == "__main__":

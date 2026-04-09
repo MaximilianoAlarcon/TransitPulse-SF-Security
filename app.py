@@ -157,12 +157,26 @@ def db_query():
 @app.route("/drop-legacy-otp-tables", methods=["POST"])
 def drop_legacy_otp_tables():
     query = """
-    DROP TABLE IF EXISTS connections CASCADE;
-    DROP TABLE IF EXISTS routes CASCADE;
-    DROP TABLE IF EXISTS shapes CASCADE;
-    DROP TABLE IF EXISTS stop_times CASCADE;
-    DROP TABLE IF EXISTS stops CASCADE;
-    DROP TABLE IF EXISTS trips CASCADE;
+CREATE INDEX IF NOT EXISTS idx_incidents_raw_incident_datetime
+ON incidents_raw (incident_datetime);
+
+CREATE INDEX IF NOT EXISTS idx_incidents_raw_incident_date
+ON incidents_raw (incident_date);
+
+CREATE INDEX IF NOT EXISTS idx_incidents_raw_district_category_datetime
+ON incidents_raw (police_district, incident_category, incident_datetime);
+
+CREATE INDEX IF NOT EXISTS idx_incident_counts_hourly_key
+ON incident_counts_hourly (bucket_start, police_district, incident_category);
+
+CREATE INDEX IF NOT EXISTS idx_incidents_raw_delay_key
+ON incidents_raw (incident_datetime, police_district, incident_category);
+
+CREATE INDEX IF NOT EXISTS idx_forecast_training_series_bucket
+ON forecast_training_series (bucket_start);
+
+CREATE INDEX IF NOT EXISTS idx_risk_features_hourly_ts
+ON risk_features_hourly (feature_timestamp);
     """
 
     try:

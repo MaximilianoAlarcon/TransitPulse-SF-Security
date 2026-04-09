@@ -8,7 +8,10 @@ if PROJECT_ROOT not in sys.path:
 from utils import execute_etl_query
 
 SQL = """
-TRUNCATE TABLE incident_counts_hourly;
+BEGIN;
+
+DELETE FROM incident_counts_hourly
+WHERE bucket_start >= date_trunc('hour', NOW() - INTERVAL '48 hours');
 
 INSERT INTO incident_counts_hourly (
     bucket_start,
@@ -29,7 +32,10 @@ SELECT
     COUNT(*) FILTER (WHERE filed_online = true) AS filed_online_count
 FROM incidents_raw
 WHERE incident_datetime IS NOT NULL
+  AND incident_datetime >= date_trunc('hour', NOW() - INTERVAL '48 hours')
 GROUP BY 1,2,3,4;
+
+COMMIT;
 """
 
 if __name__ == "__main__":
