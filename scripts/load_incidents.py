@@ -11,6 +11,32 @@ from utils import get_db_connection
 
 API_URL = "https://data.sfgov.org/resource/wg3w-h783.json?$limit=1000"
 
+EXPECTED_FIELDS = [
+    "row_id",
+    "incident_datetime",
+    "incident_date",
+    "incident_time",
+    "incident_year",
+    "incident_day_of_week",
+    "report_datetime",
+    "incident_id",
+    "incident_number",
+    "report_type_code",
+    "report_type_description",
+    "filed_online",
+    "incident_code",
+    "incident_category",
+    "incident_subcategory",
+    "incident_description",
+    "resolution",
+    "police_district",
+    "data_as_of",
+    "data_loaded_at",
+]
+
+def normalize_row(row: dict) -> dict:
+    return {field: row.get(field) for field in EXPECTED_FIELDS}
+
 def load_incidents():
     response = requests.get(API_URL, timeout=60)
     response.raise_for_status()
@@ -98,7 +124,7 @@ def load_incidents():
         with conn:
             with conn.cursor() as cur:
                 for row in rows:
-                    cur.execute(insert_sql, row)
+                    cur.execute(insert_sql, normalize_row(row))
     finally:
         conn.close()
 
