@@ -8,6 +8,9 @@ from psycopg2.extras import RealDictCursor
 
 from utils import execute_query, execute_sql_file, get_db_connection
 
+from zoneinfo import ZoneInfo
+
+
 BASE_DIR = Path(__file__).resolve().parent
 
 DB_CONFIG = {
@@ -61,7 +64,7 @@ def parse_filters() -> dict[str, Any]:
     if window not in WINDOW_TO_DELTA:
         window = "7d"
 
-    end_dt = datetime.utcnow()
+    end_dt = datetime.now(ZoneInfo("America/Los_Angeles"))
     start_dt = end_dt - WINDOW_TO_DELTA[window]
 
     return {
