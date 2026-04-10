@@ -139,8 +139,11 @@ body {
 .dot-medium { background: #f7b267; }
 .dot-high { background: #ff6b6b; }
 .drag-handle { display: none; }
-canvas { width: 100% !important; }
-#trend-chart, #category-chart { min-height: 220px; }
+canvas {
+  width: 100% !important;
+  height: 100% !important;
+}
+#trend-chart, #category-chart { min-height: 0; }
 .leaflet-popup-content-wrapper, .leaflet-popup-tip { background: #0f172a; color: #e8eefc; }
 .popup-card { min-width: 180px; }
 
@@ -178,4 +181,11 @@ canvas { width: 100% !important; }
   .kpi-grid { grid-template-columns: 1fr; }
   .hero-title { font-size: 1.45rem; }
   .section-heading { align-items: flex-start; flex-direction: column; }
+}
+
+
+.chart-box {
+  position: relative;
+  height: 260px;
+  width: 100%;
 }

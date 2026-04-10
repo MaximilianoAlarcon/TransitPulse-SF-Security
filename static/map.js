@@ -79,61 +79,55 @@ function updateKPIs(kpis) {
   document.getElementById('kpi-delay').textContent = `${Number(kpis.avg_report_delay_minutes || 0).toFixed(1)} min`;
 }
 
-function renderTrendChart(payload) {
-  const ctx = document.getElementById('trend-chart');
-  const labels = payload.series.map(item => {
-    const dt = new Date(item.bucket);
-    return payload.granularity === 'daily'
-      ? dt.toLocaleDateString([], { month: 'short', day: 'numeric' })
-      : dt.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit' });
-  });
-  const data = payload.series.map(item => item.total_incidents);
+let trendChartInstance = null;
+let categoryChartInstance = null;
 
-  document.getElementById('trend-granularity').textContent = payload.granularity === 'daily' ? 'Daily series' : 'Hourly series';
+function renderTrendChart(labels, values) {
+    const canvas = document.getElementById("trend-chart");
+    const ctx = canvas.getContext("2d");
 
-  if (appState.charts.trend) appState.charts.trend.destroy();
-  appState.charts.trend = new Chart(ctx, {
-    type: 'line',
-    data: {
-      labels,
-      datasets: [{
-        label: 'Incidents',
-        data,
-        borderWidth: 2,
-        tension: 0.25,
-        fill: true
-      }]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: { legend: { display: false } },
-      scales: {
-        x: { ticks: { color: '#bcd0f7', maxTicksLimit: 8 }, grid: { color: 'rgba(255,255,255,0.05)' } },
-        y: { ticks: { color: '#bcd0f7' }, grid: { color: 'rgba(255,255,255,0.05)' } }
-      }
+    if (trendChartInstance) {
+        trendChartInstance.destroy();
     }
-  });
+
+    trendChartInstance = new Chart(ctx, {
+        type: "line",
+        data: {
+            labels,
+            datasets: [{
+                label: "Incidents",
+                data: values,
+                tension: 0.3
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false
+        }
+    });
 }
 
-function renderCategoryChart(payload) {
-  const ctx = document.getElementById('category-chart');
-  if (appState.charts.category) appState.charts.category.destroy();
+function renderCategoryChart(labels, values) {
+    const canvas = document.getElementById("category-chart");
+    const ctx = canvas.getContext("2d");
 
-  appState.charts.category = new Chart(ctx, {
-    type: 'doughnut',
-    data: {
-      labels: payload.labels,
-      datasets: [{ data: payload.values, borderWidth: 0 }]
-    },
-    options: {
-      responsive: true,
-      maintainAspectRatio: false,
-      plugins: {
-        legend: { position: 'bottom', labels: { color: '#d7e5ff' } }
-      }
+    if (categoryChartInstance) {
+        categoryChartInstance.destroy();
     }
-  });
+
+    categoryChartInstance = new Chart(ctx, {
+        type: "doughnut",
+        data: {
+            labels,
+            datasets: [{
+                data: values
+            }]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false
+        }
+    });
 }
 
 function riskBadgeClass(value) {
