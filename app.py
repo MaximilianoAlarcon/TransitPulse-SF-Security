@@ -4,10 +4,9 @@ from pathlib import Path
 from typing import Any
 
 from flask import Flask, jsonify, render_template, request
-import psycopg2
 from psycopg2.extras import RealDictCursor
 
-from utils import get_db_connection, execute_query, execute_sql_file
+from utils import execute_query, execute_sql_file, get_db_connection
 
 BASE_DIR = Path(__file__).resolve().parent
 
@@ -31,14 +30,14 @@ SF_CENTER = {"lat": 37.7749, "lon": -122.4194}
 MAP_POINT_LIMIT = 600
 
 
-def fetch_all_dict(query: str, params: tuple[Any, ...] = ()):
+def fetch_all_dict(query: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(query, params)
             return [dict(row) for row in cur.fetchall()]
 
 
-def fetch_one_dict(query: str, params: tuple[Any, ...] = ()):
+def fetch_one_dict(query: str, params: tuple[Any, ...] = ()) -> dict[str, Any] | None:
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(query, params)
@@ -47,30 +46,23 @@ def fetch_one_dict(query: str, params: tuple[Any, ...] = ()):
 
 
 def safe_int(value: Any) -> int:
-    if value is None:
-        return 0
-    return int(value)
+    return 0 if value is None else int(value)
 
 
 def safe_float(value: Any, digits: int = 2) -> float:
-    if value is None:
-        return 0.0
-    return round(float(value), digits)
+    return 0.0 if value is None else round(float(value), digits)
 
 
-def parse_filters():
+def parse_filters() -> dict[str, Any]:
     window = request.args.get("window", "7d")
-    district = (request.args.get("district") or "all").strip()
-    category = (request.args.get("category") or "all").strip()
+    district = (request.args.get("district") or "all").strip() or "all"
+    category = (request.args.get("category") or "all").strip() or "all"
 
     if window not in WINDOW_TO_DELTA:
         window = "7d"
 
     end_dt = datetime.utcnow()
     start_dt = end_dt - WINDOW_TO_DELTA[window]
-
-    district = "all" if not district else district
-    category = "all" if not category else category
 
     return {
         "window": window,
@@ -81,8 +73,11 @@ def parse_filters():
     }
 
 
-def apply_common_filters(alias: str, filters: dict[str, Any], timestamp_column: str):
-    conditions = [f"{alias}.{timestamp_column} >= %s", f"{alias}.{timestamp_column} < %s"]
+def apply_common_filters(alias: str, filters: dict[str, Any], timestamp_column: str) -> tuple[str, tuple[Any, ...]]:
+    conditions = [
+        f"{alias}.{timestamp_column} >= %s",
+        f"{alias}.{timestamp_column} < %s",
+    ]
     params: list[Any] = [filters["start_dt"], filters["end_dt"]]
 
     if filters["district"].lower() != "all":
@@ -129,7 +124,6 @@ def db_test():
 @app.route("/init-db", methods=["POST"])
 def init_db():
     sql_file = BASE_DIR / "db_structure.sql"
-
     if not sql_file.exists():
         return jsonify({"status": "error", "message": "db_structure.sql not found"}), 500
 
@@ -139,52 +133,7 @@ def init_db():
             {
                 "status": "ok",
                 "message": "Database structure created successfully",
-                "sql_file": str(sql_file.name),
-            }
-        )
-    except Exception as exc:
-        return jsonify({"status": "error", "message": str(exc)}), 500
-
-
-@app.route("/db-tables")
-def db_tables():
-    query = """
-        SELECT
-            t.table_schema,
-            t.table_name,
-            COALESCE(s.n_live_tup::bigint, 0) AS estimated_rows,
-            obj_description((quote_ident(t.table_schema) || '.' || quote_ident(t.table_name))::regclass, 'pg_class') AS table_comment
-        FROM information_schema.tables AS t
-        LEFT JOIN pg_stat_user_tables AS s
-            ON s.schemaname = t.table_schema
-           AND s.relname = t.table_name
-        WHERE t.table_type = 'BASE TABLE'
-          AND t.table_schema NOT IN ('pg_catalog', 'information_schema')
-        ORDER BY t.table_schema, t.table_name;
-    """
-
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(query)
-                rows = cur.fetchall()
-
-        tables = [
-            {
-                "schema": row[0],
-                "table_name": row[1],
-                "estimated_rows": row[2],
-                "comment": row[3],
-            }
-            for row in rows
-        ]
-
-        return jsonify(
-            {
-                "status": "ok",
-                "database": DB_CONFIG.get("database"),
-                "total_tables": len(tables),
-                "tables": tables,
+                "sql_file": sql_file.name,
             }
         )
     except Exception as exc:
@@ -198,7 +147,6 @@ def db_query():
 
     try:
         result = execute_query(DB_CONFIG, query)
-
         if result["has_result_set"]:
             return jsonify(
                 {
@@ -228,17 +176,15 @@ def db_query():
 @app.route("/api/dashboard/filters")
 def api_dashboard_filters():
     filters = parse_filters()
-
     district_where, district_params = apply_common_filters("h", {**filters, "category": "all"}, "bucket_start")
     category_where, category_params = apply_common_filters("h", {**filters, "district": "all"}, "bucket_start")
 
     districts = fetch_all_dict(
         f"""
-        SELECT h.police_district AS value, COUNT(*) AS rows_count
+        SELECT h.police_district AS value
         FROM incident_counts_hourly h
         WHERE {district_where}
-          AND h.police_district IS NOT NULL
-          AND h.police_district <> ''
+          AND COALESCE(h.police_district, '') <> ''
         GROUP BY h.police_district
         ORDER BY h.police_district;
         """,
@@ -247,11 +193,10 @@ def api_dashboard_filters():
 
     categories = fetch_all_dict(
         f"""
-        SELECT h.incident_category AS value, COUNT(*) AS rows_count
+        SELECT h.incident_category AS value
         FROM incident_counts_hourly h
         WHERE {category_where}
-          AND h.incident_category IS NOT NULL
-          AND h.incident_category <> ''
+          AND COALESCE(h.incident_category, '') <> ''
         GROUP BY h.incident_category
         ORDER BY h.incident_category;
         """,
@@ -261,11 +206,6 @@ def api_dashboard_filters():
     return jsonify(
         {
             "status": "ok",
-            "filters": {
-                "window": filters["window"],
-                "district": filters["district"],
-                "category": filters["category"],
-            },
             "districts": [{"value": "all", "label": "All districts"}] + [
                 {"value": row["value"], "label": row["value"]} for row in districts
             ],
@@ -297,11 +237,6 @@ def api_dashboard_overview():
     return jsonify(
         {
             "status": "ok",
-            "filters": {
-                "window": filters["window"],
-                "district": filters["district"],
-                "category": filters["category"],
-            },
             "kpis": {
                 "total_incidents": safe_int(row.get("total_incidents")),
                 "open_ratio": safe_float((row.get("open_ratio") or 0) * 100),
@@ -318,39 +253,36 @@ def api_dashboard_trend():
     is_daily = filters["window"] == "30d"
     table = "incident_counts_daily" if is_daily else "incident_counts_hourly"
     time_col = "bucket_date" if is_daily else "bucket_start"
-    alias = "t"
-    where_clause, params = apply_common_filters(alias, filters, time_col)
+    where_clause, params = apply_common_filters("t", filters, time_col)
 
     rows = fetch_all_dict(
         f"""
         SELECT
-            {alias}.{time_col} AS bucket,
-            SUM({alias}.total_incidents) AS total_incidents,
-            SUM({alias}.open_active_count) AS open_active_count,
-            SUM({alias}.filed_online_count) AS filed_online_count
-        FROM {table} {alias}
+            t.{time_col} AS bucket,
+            SUM(t.total_incidents) AS total_incidents,
+            SUM(t.open_active_count) AS open_active_count,
+            SUM(t.filed_online_count) AS filed_online_count
+        FROM {table} t
         WHERE {where_clause}
-        GROUP BY {alias}.{time_col}
-        ORDER BY {alias}.{time_col};
+        GROUP BY t.{time_col}
+        ORDER BY t.{time_col};
         """,
         params,
     )
-
-    series = [
-        {
-            "bucket": row["bucket"].isoformat() if row["bucket"] else None,
-            "total_incidents": safe_int(row["total_incidents"]),
-            "open_active_count": safe_int(row["open_active_count"]),
-            "filed_online_count": safe_int(row["filed_online_count"]),
-        }
-        for row in rows
-    ]
 
     return jsonify(
         {
             "status": "ok",
             "granularity": "daily" if is_daily else "hourly",
-            "series": series,
+            "series": [
+                {
+                    "bucket": row["bucket"].isoformat() if row.get("bucket") else None,
+                    "total_incidents": safe_int(row.get("total_incidents")),
+                    "open_active_count": safe_int(row.get("open_active_count")),
+                    "filed_online_count": safe_int(row.get("filed_online_count")),
+                }
+                for row in rows
+            ],
         }
     )
 
@@ -358,10 +290,10 @@ def api_dashboard_trend():
 @app.route("/api/dashboard/district-pressure")
 def api_dashboard_district_pressure():
     filters = parse_filters()
-    table = "incident_counts_daily" if filters["window"] == "30d" else "incident_counts_hourly"
-    time_col = "bucket_date" if filters["window"] == "30d" else "bucket_start"
-    alias = "d"
-    where_clause, params = apply_common_filters(alias, {**filters, "district": "all"}, time_col)
+    is_daily = filters["window"] == "30d"
+    table = "incident_counts_daily" if is_daily else "incident_counts_hourly"
+    time_col = "bucket_date" if is_daily else "bucket_start"
+    where_clause, params = apply_common_filters("d", {**filters, "district": "all"}, time_col)
 
     rows = fetch_all_dict(
         f"""
@@ -372,8 +304,7 @@ def api_dashboard_district_pressure():
             SUM(d.filed_online_count) AS filed_online_count
         FROM {table} d
         WHERE {where_clause}
-          AND d.police_district IS NOT NULL
-          AND d.police_district <> ''
+          AND COALESCE(d.police_district, '') <> ''
         GROUP BY d.police_district
         ORDER BY total_incidents DESC, d.police_district ASC
         LIMIT 10;
@@ -381,29 +312,28 @@ def api_dashboard_district_pressure():
         params,
     )
 
-    result = []
+    districts = []
     for row in rows:
-        total = max(safe_int(row["total_incidents"]), 1)
-        open_ratio = safe_float((safe_int(row["open_active_count"]) / total) * 100)
-        result.append(
+        total = max(safe_int(row.get("total_incidents")), 1)
+        districts.append(
             {
-                "police_district": row["police_district"],
-                "total_incidents": safe_int(row["total_incidents"]),
-                "open_ratio": open_ratio,
-                "online_ratio": safe_float((safe_int(row["filed_online_count"]) / total) * 100),
+                "police_district": row.get("police_district") or "Unknown",
+                "total_incidents": safe_int(row.get("total_incidents")),
+                "open_ratio": safe_float((safe_int(row.get("open_active_count")) / total) * 100),
+                "online_ratio": safe_float((safe_int(row.get("filed_online_count")) / total) * 100),
             }
         )
 
-    return jsonify({"status": "ok", "districts": result})
+    return jsonify({"status": "ok", "districts": districts})
 
 
 @app.route("/api/dashboard/category-mix")
 def api_dashboard_category_mix():
     filters = parse_filters()
-    table = "incident_counts_daily" if filters["window"] == "30d" else "incident_counts_hourly"
-    time_col = "bucket_date" if filters["window"] == "30d" else "bucket_start"
-    alias = "c"
-    where_clause, params = apply_common_filters(alias, {**filters, "category": "all"}, time_col)
+    is_daily = filters["window"] == "30d"
+    table = "incident_counts_daily" if is_daily else "incident_counts_hourly"
+    time_col = "bucket_date" if is_daily else "bucket_start"
+    where_clause, params = apply_common_filters("c", {**filters, "category": "all"}, time_col)
 
     rows = fetch_all_dict(
         f"""
@@ -412,8 +342,7 @@ def api_dashboard_category_mix():
             SUM(c.total_incidents) AS total_incidents
         FROM {table} c
         WHERE {where_clause}
-          AND c.incident_category IS NOT NULL
-          AND c.incident_category <> ''
+          AND COALESCE(c.incident_category, '') <> ''
         GROUP BY c.incident_category
         ORDER BY total_incidents DESC, c.incident_category ASC
         LIMIT 8;
@@ -434,7 +363,6 @@ def api_dashboard_category_mix():
 def api_dashboard_risk_signals():
     filters = parse_filters()
     where_clause, params = apply_common_filters("r", filters, "feature_timestamp")
-
     row = fetch_one_dict(
         f"""
         SELECT
@@ -452,7 +380,6 @@ def api_dashboard_risk_signals():
         params,
     ) or {}
 
-    mode = request.args.get("risk_mode", "volume")
     open_ratio_pct = safe_float((row.get("open_active_ratio_24h") or 0) * 100)
     delay_minutes = safe_float(row.get("avg_report_delay_minutes_24h"))
 
@@ -467,7 +394,7 @@ def api_dashboard_risk_signals():
             "label": "Avg incidents in last 24h",
             "value": safe_float(row.get("incidents_last_24h")),
             "severity": "high" if safe_float(row.get("incidents_last_24h")) >= 80 else "medium" if safe_float(row.get("incidents_last_24h")) >= 30 else "low",
-            "description": "Daily pressure proxy, useful before model scoring exists.",
+            "description": "Daily pressure proxy before model scoring exists.",
         },
         {
             "label": "Open / Active ratio 24h",
@@ -485,10 +412,11 @@ def api_dashboard_risk_signals():
         },
     ]
 
+    mode = request.args.get("risk_mode", "volume")
     if mode == "open":
-        signals.sort(key=lambda x: (0 if x["label"].startswith("Open") else 1, x["label"]))
+        signals.sort(key=lambda item: (0 if item["label"].startswith("Open") else 1, item["label"]))
     elif mode == "delay":
-        signals.sort(key=lambda x: (0 if x["label"].startswith("Avg report delay") else 1, x["label"]))
+        signals.sort(key=lambda item: (0 if item["label"].startswith("Avg report delay") else 1, item["label"]))
 
     return jsonify({"status": "ok", "signals": signals})
 
@@ -523,37 +451,36 @@ def api_dashboard_map_points():
 
     points = []
     for row in rows:
-        category = row.get("incident_category") or "Unknown"
+        category = (row.get("incident_category") or "Unknown").lower()
+        if any(word in category for word in ["assault", "robbery", "burglary", "weapon"]):
+            risk_level = "high"
+        elif any(word in category for word in ["theft", "larceny", "vandalism"]):
+            risk_level = "medium"
+        else:
+            risk_level = "low"
+
         points.append(
             {
                 "id": row.get("row_id"),
                 "lat": float(row["latitude"]),
                 "lon": float(row["longitude"]),
                 "police_district": row.get("police_district") or "Unknown",
-                "incident_category": category,
+                "incident_category": row.get("incident_category") or "Unknown",
                 "incident_subcategory": row.get("incident_subcategory") or "Unknown",
                 "incident_description": row.get("incident_description") or "No description",
                 "resolution": row.get("resolution") or "Unknown",
                 "incident_datetime": row["incident_datetime"].isoformat() if row.get("incident_datetime") else None,
-                "risk_level": "high" if any(word in category.lower() for word in ["assault", "robbery", "burglary", "weapon"]) else "medium" if any(word in category.lower() for word in ["theft", "larceny", "vandalism"]) else "low",
+                "risk_level": risk_level,
             }
         )
 
-    return jsonify(
-        {
-            "status": "ok",
-            "center": SF_CENTER,
-            "point_count": len(points),
-            "points": points,
-        }
-    )
+    return jsonify({"status": "ok", "center": SF_CENTER, "point_count": len(points), "points": points})
 
 
 @app.route("/api/dashboard/forecast-training-summary")
 def api_dashboard_forecast_training_summary():
     filters = parse_filters()
     where_clause, params = apply_common_filters("f", filters, "bucket_start")
-
     row = fetch_one_dict(
         f"""
         SELECT

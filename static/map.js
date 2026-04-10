@@ -50,84 +50,113 @@ function getCommonParams() {
 
 function initMap() {
   appState.map = L.map('map', { zoomControl: false }).setView([37.7749, -122.4194], 12);
-
   L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
     attribution: '&copy; OpenStreetMap contributors'
   }).addTo(appState.map);
-
   L.control.zoom({ position: 'topright' }).addTo(appState.map);
-
   appState.layers.incidents = L.layerGroup().addTo(appState.map);
-}
-
-function riskColor(level) {
-  if (level === 'high') return '#ff6b6b';
-  if (level === 'medium') return '#f7b267';
-  return '#66c7f4';
 }
 
 function updateStatus(text, isError = false) {
   const el = document.getElementById('live-status');
+  if (!el) return;
   el.textContent = text;
   el.classList.toggle('status-error', isError);
 }
 
+function formatNumber(value, digits = 0) {
+  return new Intl.NumberFormat(undefined, {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits
+  }).format(Number(value || 0));
+}
+
 function updateKPIs(kpis) {
-  document.getElementById('kpi-total').textContent = new Intl.NumberFormat().format(kpis.total_incidents || 0);
-  document.getElementById('kpi-open').textContent = `${Number(kpis.open_ratio || 0).toFixed(1)}%`;
-  document.getElementById('kpi-online').textContent = `${Number(kpis.online_ratio || 0).toFixed(1)}%`;
-  document.getElementById('kpi-delay').textContent = `${Number(kpis.avg_report_delay_minutes || 0).toFixed(1)} min`;
+  document.getElementById('kpi-total').textContent = formatNumber(kpis.total_incidents, 0);
+  document.getElementById('kpi-open').textContent = `${formatNumber(kpis.open_ratio, 1)}%`;
+  document.getElementById('kpi-online').textContent = `${formatNumber(kpis.online_ratio, 1)}%`;
+  document.getElementById('kpi-delay').textContent = `${formatNumber(kpis.avg_report_delay_minutes, 1)} min`;
 }
 
-let trendChartInstance = null;
-let categoryChartInstance = null;
+function renderTrendChart(payload) {
+  if (!payload || !Array.isArray(payload.series)) {
+    throw new Error('Invalid trend payload');
+  }
 
-function renderTrendChart(labels, values) {
-    const canvas = document.getElementById("trend-chart");
-    const ctx = canvas.getContext("2d");
+  const canvas = document.getElementById('trend-chart');
+  const labels = payload.series.map((item) => {
+    const dt = item.bucket ? new Date(item.bucket) : null;
+    if (!dt || Number.isNaN(dt.getTime())) return 'n/a';
+    return payload.granularity === 'daily'
+      ? dt.toLocaleDateString([], { month: 'short', day: 'numeric' })
+      : dt.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit' });
+  });
+  const values = payload.series.map((item) => Number(item.total_incidents || 0));
 
-    if (trendChartInstance) {
-        trendChartInstance.destroy();
-    }
+  document.getElementById('trend-granularity').textContent = payload.granularity === 'daily' ? 'Daily series' : 'Hourly series';
 
-    trendChartInstance = new Chart(ctx, {
-        type: "line",
-        data: {
-            labels,
-            datasets: [{
-                label: "Incidents",
-                data: values,
-                tension: 0.3
-            }]
+  if (appState.charts.trend) appState.charts.trend.destroy();
+  appState.charts.trend = new Chart(canvas, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [{
+        label: 'Incidents',
+        data: values,
+        borderWidth: 2,
+        tension: 0.25,
+        fill: true
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      plugins: { legend: { display: false } },
+      scales: {
+        x: {
+          ticks: { color: '#bcd0f7', maxTicksLimit: 8 },
+          grid: { color: 'rgba(255,255,255,0.05)' }
         },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false
+        y: {
+          beginAtZero: true,
+          ticks: { color: '#bcd0f7' },
+          grid: { color: 'rgba(255,255,255,0.05)' }
         }
-    });
+      }
+    }
+  });
 }
 
-function renderCategoryChart(labels, values) {
-    const canvas = document.getElementById("category-chart");
-    const ctx = canvas.getContext("2d");
+function renderCategoryChart(payload) {
+  if (!payload || !Array.isArray(payload.labels) || !Array.isArray(payload.values)) {
+    throw new Error('Invalid category payload');
+  }
 
-    if (categoryChartInstance) {
-        categoryChartInstance.destroy();
-    }
+  const canvas = document.getElementById('category-chart');
+  if (appState.charts.category) appState.charts.category.destroy();
 
-    categoryChartInstance = new Chart(ctx, {
-        type: "doughnut",
-        data: {
-            labels,
-            datasets: [{
-                data: values
-            }]
-        },
-        options: {
-            responsive: true,
-            maintainAspectRatio: false
+  appState.charts.category = new Chart(canvas, {
+    type: 'doughnut',
+    data: {
+      labels: payload.labels,
+      datasets: [{
+        data: payload.values.map((value) => Number(value || 0)),
+        borderWidth: 0
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      plugins: {
+        legend: {
+          position: 'bottom',
+          labels: { color: '#d7e5ff' }
         }
-    });
+      }
+    }
+  });
 }
 
 function riskBadgeClass(value) {
@@ -140,20 +169,20 @@ function renderDistricts(items) {
   const container = document.getElementById('district-list');
   container.innerHTML = '';
 
-  if (!items.length) {
+  if (!Array.isArray(items) || items.length === 0) {
     container.innerHTML = '<div class="stack-item"><span class="stack-title">No data for selected scope</span></div>';
     return;
   }
 
-  items.forEach(item => {
+  items.forEach((item) => {
     const el = document.createElement('div');
     el.className = 'stack-item';
     el.innerHTML = `
       <div>
         <div class="stack-title">${item.police_district}</div>
-        <div class="stack-subtitle">${item.total_incidents} incidents · ${item.online_ratio.toFixed(1)}% online</div>
+        <div class="stack-subtitle">${formatNumber(item.total_incidents)} incidents · ${formatNumber(item.online_ratio, 1)}% online</div>
       </div>
-      <span class="risk-badge ${riskBadgeClass(item.open_ratio)}">${item.open_ratio.toFixed(1)}% open</span>
+      <span class="risk-badge ${riskBadgeClass(Number(item.open_ratio || 0))}">${formatNumber(item.open_ratio, 1)}% open</span>
     `;
     container.appendChild(el);
   });
@@ -163,20 +192,20 @@ function renderRiskSignals(items) {
   const container = document.getElementById('risk-signals');
   container.innerHTML = '';
 
-  if (!items.length) {
+  if (!Array.isArray(items) || items.length === 0) {
     container.innerHTML = '<div class="signal-item"><div>No risk signals available.</div></div>';
     return;
   }
 
-  items.forEach(item => {
+  items.forEach((item) => {
     const el = document.createElement('div');
     el.className = 'signal-item';
     el.innerHTML = `
-      <span class="signal-dot signal-${item.severity}"></span>
+      <span class="signal-dot signal-${item.severity || 'low'}"></span>
       <div class="signal-content">
-        <div class="signal-label">${item.label}</div>
-        <div class="signal-value">${Number(item.value).toFixed(1)}${item.suffix || ''}</div>
-        <div class="small-muted">${item.description}</div>
+        <div class="signal-label">${item.label || 'Signal'}</div>
+        <div class="signal-value">${formatNumber(item.value, 1)}${item.suffix || ''}</div>
+        <div class="small-muted">${item.description || ''}</div>
       </div>
     `;
     container.appendChild(el);
@@ -191,11 +220,11 @@ function renderForecastSummary(summary) {
   container.innerHTML = `
     <div class="roadmap-item">
       <strong>Training rows</strong>
-      <span>${new Intl.NumberFormat().format(summary.rows_count || 0)} rows in forecast_training_series.</span>
+      <span>${formatNumber(summary.rows_count)} rows in forecast_training_series.</span>
     </div>
     <div class="roadmap-item">
       <strong>Distinct series</strong>
-      <span>${new Intl.NumberFormat().format(summary.series_count || 0)} district/category sequences available for future forecasting.</span>
+      <span>${formatNumber(summary.series_count)} district/category sequences available for future forecasting.</span>
     </div>
     <div class="roadmap-item">
       <strong>Coverage window</strong>
@@ -209,7 +238,7 @@ function setSelectOptions(selectId, options, selectedValue) {
   const current = selectedValue || 'all';
   select.innerHTML = '';
 
-  options.forEach(option => {
+  (options || []).forEach((option) => {
     const el = document.createElement('option');
     el.value = option.value;
     el.textContent = option.label;
@@ -231,8 +260,15 @@ function popupHtml(point) {
   `;
 }
 
+function riskColor(level) {
+  if (level === 'high') return '#ff6b6b';
+  if (level === 'medium') return '#f7b267';
+  return '#66c7f4';
+}
+
 function renderMap(payload) {
-  document.getElementById('map-caption').textContent = `${payload.point_count} geo incidents loaded`;
+  const caption = document.getElementById('map-caption');
+  caption.textContent = `${Number(payload.point_count || 0)} geo incidents loaded`;
 
   appState.layers.incidents.clearLayers();
   if (appState.layers.heat) {
@@ -240,12 +276,17 @@ function renderMap(payload) {
     appState.layers.heat = null;
   }
 
+  const points = Array.isArray(payload.points) ? payload.points : [];
   const heatData = [];
 
-  payload.points.forEach(point => {
-    heatData.push([point.lat, point.lon, point.risk_level === 'high' ? 1 : point.risk_level === 'medium' ? 0.6 : 0.3]);
+  points.forEach((point) => {
+    const lat = Number(point.lat);
+    const lon = Number(point.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
 
-    const marker = L.circleMarker([point.lat, point.lon], {
+    heatData.push([lat, lon, point.risk_level === 'high' ? 1 : point.risk_level === 'medium' ? 0.6 : 0.3]);
+
+    const marker = L.circleMarker([lat, lon], {
       radius: point.risk_level === 'high' ? 7 : point.risk_level === 'medium' ? 5.5 : 4.5,
       color: riskColor(point.risk_level),
       weight: 1,
@@ -256,7 +297,7 @@ function renderMap(payload) {
     appState.layers.incidents.addLayer(marker);
   });
 
-  if (appState.filters.mapLayer === 'heat' && heatData.length) {
+  if (appState.filters.mapLayer === 'heat' && heatData.length > 0) {
     appState.layers.heat = L.heatLayer(heatData, {
       radius: 20,
       blur: 18,
@@ -270,8 +311,8 @@ function renderMap(payload) {
     appState.layers.incidents.addTo(appState.map);
   }
 
-  if (payload.points.length) {
-    const bounds = L.latLngBounds(payload.points.map(p => [p.lat, p.lon]));
+  if (points.length > 0) {
+    const bounds = L.latLngBounds(points.map((point) => [Number(point.lat), Number(point.lon)]));
     appState.map.fitBounds(bounds.pad(0.08));
   }
 }
@@ -305,8 +346,8 @@ async function refreshDashboard() {
     renderDistricts(districts.districts || []);
     renderCategoryChart(categories);
     renderRiskSignals(riskSignals.signals || []);
-    renderMap(mapData);
-    renderForecastSummary(forecastSummary);
+    renderMap(mapData || {});
+    renderForecastSummary(forecastSummary || {});
 
     updateStatus('Live data connected');
   } catch (error) {
@@ -379,15 +420,15 @@ function initDragHandle() {
     setTimeout(() => appState.map.invalidateSize(), 0);
   };
 
-  handle.addEventListener('touchstart', () => dragging = true, { passive: true });
-  handle.addEventListener('touchend', () => dragging = false, { passive: true });
+  handle.addEventListener('touchstart', () => { dragging = true; }, { passive: true });
+  handle.addEventListener('touchend', () => { dragging = false; }, { passive: true });
   handle.addEventListener('touchmove', (e) => {
     if (!dragging) return;
     move(e.touches[0].clientY);
   }, { passive: true });
 
-  handle.addEventListener('mousedown', () => dragging = true);
-  window.addEventListener('mouseup', () => dragging = false);
+  handle.addEventListener('mousedown', () => { dragging = true; });
+  window.addEventListener('mouseup', () => { dragging = false; });
   window.addEventListener('mousemove', (e) => {
     if (!dragging) return;
     move(e.clientY);
