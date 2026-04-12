@@ -161,10 +161,24 @@ function renderCategoryChart(payload) {
       responsive: true,
       maintainAspectRatio: false,
       animation: false,
+      cutout: '62%',
+      layout: {
+        padding: 0
+      },
       plugins: {
         legend: {
           position: 'bottom',
-          labels: { color: '#d7e5ff' }
+          labels: {
+            color: '#d7e5ff',
+            boxWidth: 10,
+            boxHeight: 10,
+            padding: 10,
+            usePointStyle: true,
+            pointStyle: 'circle',
+            font: {
+              size: 11
+            }
+          }
         }
       }
     }
@@ -488,15 +502,17 @@ function initCollapsibles() {
       const isCollapsed = card.classList.toggle('is-collapsed');
       btn.textContent = isCollapsed ? 'Show' : 'Hide';
       btn.setAttribute('aria-expanded', String(!isCollapsed));
+
       requestMapResize();
+      window.setTimeout(requestMapResize, 320);
     });
   });
 }
 
 function getMobileSheetLimits() {
   const viewport = window.innerHeight;
-  const minMapHeight = Math.round(viewport * 0.10);
-  const maxMapHeight = Math.round(viewport * 0.88);
+  const minMapHeight = Math.round(viewport * 0.04);
+  const maxMapHeight = Math.round(viewport * 0.94);
   return { minMapHeight, maxMapHeight };
 }
 
