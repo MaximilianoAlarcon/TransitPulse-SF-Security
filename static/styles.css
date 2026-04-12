@@ -48,7 +48,7 @@ body {
 }
 
 .sidebar-panel {
-  z-index: 20;
+  z-index: 1;
   border-right: 1px solid var(--line);
   background: rgba(4, 10, 20, 0.52);
   backdrop-filter: blur(18px);
@@ -194,7 +194,44 @@ body {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 12px;
-  z-index: 20 !important;
+}
+
+
+.filter-card {
+  position: relative;
+  z-index: 30;
+  overflow: visible;
+}
+
+.filter-card .row,
+.filter-card .col-12,
+.filter-card .col-6 {
+  position: relative;
+}
+
+.kpi-grid {
+  position: relative;
+  z-index: 1;
+}
+
+.custom-select {
+  position: relative;
+  z-index: 40;
+}
+
+.custom-select.is-open {
+  z-index: 1600;
+}
+
+.custom-select-menu {
+  z-index: 1700;
+}
+
+.sidebar-scroll,
+.analytics-panel,
+.analytics-grid,
+.analytics-card {
+  overflow: visible;
 }
 
 .kpi-card {
@@ -587,5 +624,13 @@ body {
 
   .custom-select-button {
     min-height: 44px;
+  }
+}
+
+
+@media (max-width: 991.98px) {
+  .filter-card,
+  .custom-select.is-open {
+    z-index: 1800;
   }
 }

@@ -435,7 +435,38 @@ def api_dashboard_risk_signals():
 @app.route("/api/dashboard/map-points")
 def api_dashboard_map_points():
     filters = parse_filters()
+    risk_mode = (request.args.get("risk_mode") or "volume").strip().lower()
+    if risk_mode not in {"volume", "open", "delay"}:
+        risk_mode = "volume"
+
     where_clause, params = apply_common_filters("r", filters, "incident_datetime")
+
+    risk_where, risk_params = apply_common_filters("rf", filters, "feature_timestamp")
+    risk_rows = fetch_all_dict(
+        f"""
+        SELECT
+            rf.police_district,
+            rf.incident_category,
+            AVG(rf.incidents_last_24h) AS volume_score,
+            AVG(rf.open_active_ratio_24h) AS open_score,
+            AVG(rf.avg_report_delay_minutes_24h) AS delay_score
+        FROM risk_features_hourly rf
+        WHERE {risk_where}
+        GROUP BY rf.police_district, rf.incident_category;
+        """,
+        risk_params,
+    )
+
+    risk_lookup: dict[tuple[str, str], dict[str, float]] = {}
+    for row in risk_rows:
+        district_key = row.get("police_district") or "Unknown"
+        category_key = row.get("incident_category") or "Unknown"
+        risk_lookup[(district_key, category_key)] = {
+            "volume": float(row.get("volume_score") or 0.0),
+            "open": float(row.get("open_score") or 0.0),
+            "delay": float(row.get("delay_score") or 0.0),
+        }
+
     params = params + (MAP_POINT_LIMIT,)
 
     rows = fetch_all_dict(
@@ -460,32 +491,84 @@ def api_dashboard_map_points():
         params,
     )
 
+    def classify_risk(score: float, mode: str) -> str:
+        if mode == "open":
+            if score >= 0.40:
+                return "high"
+            if score >= 0.20:
+                return "medium"
+            return "low"
+        if mode == "delay":
+            if score >= 120:
+                return "high"
+            if score >= 45:
+                return "medium"
+            return "low"
+        if score >= 12:
+            return "high"
+        if score >= 4:
+            return "medium"
+        return "low"
+
+    def heat_weight(score: float, level: str, mode: str) -> float:
+        if mode == "open":
+            return min(max(score, 0.12), 1.0)
+        if mode == "delay":
+            return min(max(score / 180.0, 0.12), 1.0)
+        if score <= 0:
+            return 0.12 if level == "low" else 0.2
+        return min(max(score / 18.0, 0.18), 1.0)
+
+    def marker_radius(level: str, score: float, mode: str) -> float:
+        if level == "high":
+            return 7.5 if mode != "delay" else 8.0
+        if level == "medium":
+            return 6.0
+        return 4.5
+
     points = []
     for row in rows:
-        category = (row.get("incident_category") or "Unknown").lower()
-        if any(word in category for word in ["assault", "robbery", "burglary", "weapon"]):
-            risk_level = "high"
-        elif any(word in category for word in ["theft", "larceny", "vandalism"]):
-            risk_level = "medium"
-        else:
-            risk_level = "low"
+        district_key = row.get("police_district") or "Unknown"
+        category_key = row.get("incident_category") or "Unknown"
+        scores = risk_lookup.get((district_key, category_key), {"volume": 0.0, "open": 0.0, "delay": 0.0})
+        selected_score = float(scores.get(risk_mode) or 0.0)
+        level = classify_risk(selected_score, risk_mode)
 
         points.append(
             {
                 "id": row.get("row_id"),
                 "lat": float(row["latitude"]),
                 "lon": float(row["longitude"]),
-                "police_district": row.get("police_district") or "Unknown",
-                "incident_category": row.get("incident_category") or "Unknown",
+                "police_district": district_key,
+                "incident_category": category_key,
                 "incident_subcategory": row.get("incident_subcategory") or "Unknown",
                 "incident_description": row.get("incident_description") or "No description",
                 "resolution": row.get("resolution") or "Unknown",
                 "incident_datetime": row["incident_datetime"].isoformat() if row.get("incident_datetime") else None,
-                "risk_level": risk_level,
+                "risk_level": level,
+                "risk_score": round(selected_score, 2),
+                "risk_mode": risk_mode,
+                "heat_weight": round(heat_weight(selected_score, level, risk_mode), 3),
+                "marker_radius": marker_radius(level, selected_score, risk_mode),
             }
         )
 
-    return jsonify({"status": "ok", "center": SF_CENTER, "point_count": len(points), "points": points})
+    risk_mode_label = {
+        "volume": "Volume",
+        "open": "Open / Active",
+        "delay": "Report delay",
+    }[risk_mode]
+
+    return jsonify(
+        {
+            "status": "ok",
+            "center": SF_CENTER,
+            "point_count": len(points),
+            "risk_mode": risk_mode,
+            "risk_mode_label": risk_mode_label,
+            "points": points,
+        }
+    )
 
 
 @app.route("/api/dashboard/forecast-training-summary")
