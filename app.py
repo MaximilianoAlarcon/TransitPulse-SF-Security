@@ -222,16 +222,24 @@ def api_dashboard_filters():
 @app.route("/api/dashboard/overview")
 def api_dashboard_overview():
     filters = parse_filters()
-    where_clause, params = apply_common_filters("r", filters, "incident_datetime")
+    is_daily = filters["window"] == "30d"
+    table = "incident_counts_daily" if is_daily else "incident_counts_hourly"
+    time_col = "bucket_date" if is_daily else "bucket_start"
+    where_clause, params = apply_common_filters("t", filters, time_col)
 
     row = fetch_one_dict(
         f"""
         SELECT
-            COUNT(*) AS total_incidents,
-            AVG(CASE WHEN COALESCE(r.resolution, '') ILIKE 'Open%%' OR COALESCE(r.resolution, '') ILIKE 'Active%%' THEN 1.0 ELSE 0.0 END) AS open_ratio,
-            AVG(CASE WHEN r.filed_online THEN 1.0 ELSE 0.0 END) AS online_ratio,
-            AVG(r.report_delay_minutes) AS avg_report_delay_minutes
-        FROM incidents_raw r
+            COALESCE(SUM(t.total_incidents), 0) AS total_incidents,
+            CASE
+                WHEN COALESCE(SUM(t.total_incidents), 0) = 0 THEN 0
+                ELSE SUM(t.open_active_count)::double precision / SUM(t.total_incidents)::double precision
+            END AS open_ratio,
+            CASE
+                WHEN COALESCE(SUM(t.total_incidents), 0) = 0 THEN 0
+                ELSE SUM(t.filed_online_count)::double precision / SUM(t.total_incidents)::double precision
+            END AS online_ratio
+        FROM {table} t
         WHERE {where_clause};
         """,
         params,
@@ -244,7 +252,7 @@ def api_dashboard_overview():
                 "total_incidents": safe_int(row.get("total_incidents")),
                 "open_ratio": safe_float((row.get("open_ratio") or 0) * 100),
                 "online_ratio": safe_float((row.get("online_ratio") or 0) * 100),
-                "avg_report_delay_minutes": safe_float(row.get("avg_report_delay_minutes")),
+                "avg_report_delay_minutes": 0.0,
             },
         }
     )
