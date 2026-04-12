@@ -3,7 +3,8 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>SF Crime Intelligence Dashboard</title>
+  <title>Security San Francisco</title>
+
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" crossorigin="">
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -13,14 +14,19 @@
 </head>
 <body>
   <div id="app-shell" class="app-shell">
+
+    <!-- LEFT COLUMN / SIDEBAR -->
     <aside id="sidebar" class="sidebar-panel">
       <div class="sidebar-scroll">
+
         <section class="hero-card glass-card mb-3">
           <div class="d-flex align-items-start justify-content-between gap-3 flex-wrap">
             <div>
               <p class="eyebrow mb-2">San Francisco</p>
               <h1 class="hero-title mb-2">Crime Intelligence Dashboard</h1>
-              <p class="hero-subtitle mb-0">Real data dashboard built on incidents_raw, incident_counts_*, risk_features_hourly and forecast_training_series.</p>
+              <p class="hero-subtitle mb-0">
+                Real data dashboard built on incidents_raw, incident_counts_*, risk_features_hourly and forecast_training_series.
+              </p>
             </div>
             <span id="live-status" class="status-pill">Loading data…</span>
           </div>
@@ -31,6 +37,7 @@
             <h2>Filters</h2>
             <button id="reset-filters" class="btn btn-sm btn-outline-light">Reset</button>
           </div>
+
           <div class="row g-2">
             <div class="col-12">
               <label class="form-label">Time window</label>
@@ -40,14 +47,21 @@
                 <option value="30d">Last 30 days</option>
               </select>
             </div>
+
             <div class="col-12">
               <label class="form-label">Police district</label>
-              <select id="district-filter" class="form-select app-select"><option value="all">All districts</option></select>
+              <select id="district-filter" class="form-select app-select">
+                <option value="all">All districts</option>
+              </select>
             </div>
+
             <div class="col-12">
               <label class="form-label">Incident category</label>
-              <select id="category-filter" class="form-select app-select"><option value="all">All categories</option></select>
+              <select id="category-filter" class="form-select app-select">
+                <option value="all">All categories</option>
+              </select>
             </div>
+
             <div class="col-6">
               <label class="form-label">Map layer</label>
               <select id="map-layer" class="form-select app-select">
@@ -55,6 +69,7 @@
                 <option value="heat">Density view</option>
               </select>
             </div>
+
             <div class="col-6">
               <label class="form-label">Risk mode</label>
               <select id="risk-mode" class="form-select app-select">
@@ -72,16 +87,19 @@
             <strong id="kpi-total" class="kpi-value">0</strong>
             <span class="kpi-sub">Across selected window</span>
           </article>
+
           <article class="glass-card kpi-card">
             <span class="kpi-label">Open / Active</span>
             <strong id="kpi-open" class="kpi-value">0%</strong>
             <span class="kpi-sub">Resolution pressure</span>
           </article>
+
           <article class="glass-card kpi-card">
             <span class="kpi-label">Filed online</span>
             <strong id="kpi-online" class="kpi-value">0%</strong>
             <span class="kpi-sub">Digital reporting share</span>
           </article>
+
           <article class="glass-card kpi-card">
             <span class="kpi-label">Avg. delay</span>
             <strong id="kpi-delay" class="kpi-value">0 min</strong>
@@ -91,30 +109,10 @@
 
         <section class="glass-card mb-3">
           <div class="section-heading mb-3">
-            <h2>Trend</h2>
-            <span id="trend-granularity" class="small-muted">Hourly / daily series</span>
-          </div>
-          <div class="chart-frame">
-            <canvas id="trend-chart"></canvas>
-          </div>
-        </section>
-
-        <section class="glass-card mb-3">
-          <div class="section-heading mb-3">
             <h2>District pressure</h2>
             <span class="small-muted">Top districts</span>
           </div>
           <div id="district-list" class="stack-list"></div>
-        </section>
-
-        <section class="glass-card mb-3">
-          <div class="section-heading mb-3">
-            <h2>Category mix</h2>
-            <span class="small-muted">Selected scope</span>
-          </div>
-          <div class="chart-frame chart-frame-sm">
-            <canvas id="category-chart"></canvas>
-          </div>
         </section>
 
         <section class="glass-card mb-3">
@@ -135,29 +133,62 @@
       </div>
     </aside>
 
-    <div id="drag-handle" class="drag-handle" aria-hidden="true"><span></span></div>
+    <!-- MOBILE DRAG HANDLE -->
+    <div id="drag-handle" class="drag-handle" aria-hidden="true">
+      <span></span>
+    </div>
 
-    <main class="map-panel">
-      <div class="map-toolbar glass-card">
-        <div>
-          <div class="eyebrow mb-1">Spatial view</div>
-          <div class="toolbar-title">Incident map</div>
-          <div id="map-caption" class="small-muted">Latest incidents with geo points</div>
+    <!-- RIGHT COLUMN / DESKTOP QUADRANTS -->
+    <main class="content-panel">
+      <section class="analytics-panel">
+        <div class="analytics-grid">
+
+          <section class="glass-card analytics-card trend-card">
+            <div class="section-heading mb-3">
+              <h2>Trend</h2>
+              <span id="trend-granularity" class="small-muted">Hourly / daily series</span>
+            </div>
+            <div class="chart-frame">
+              <canvas id="trend-chart"></canvas>
+            </div>
+          </section>
+
+          <section class="glass-card analytics-card category-card">
+            <div class="section-heading mb-3">
+              <h2>Category mix</h2>
+              <span class="small-muted">Selected scope</span>
+            </div>
+            <div class="chart-frame chart-frame-sm">
+              <canvas id="category-chart"></canvas>
+            </div>
+          </section>
+
         </div>
-        <div class="toolbar-actions">
-          <button id="btn-center-sf" class="btn btn-sm btn-light">Center SF</button>
-          <button id="btn-toggle-points" class="btn btn-sm btn-outline-light">Toggle points</button>
+      </section>
+
+      <section class="map-panel">
+        <div class="map-toolbar glass-card">
+          <div>
+            <div class="eyebrow mb-1">Spatial view</div>
+            <div class="toolbar-title">Incident map</div>
+            <div id="map-caption" class="small-muted">Latest incidents with geo points</div>
+          </div>
+
+          <div class="toolbar-actions">
+            <button id="btn-center-sf" class="btn btn-sm btn-light">Center SF</button>
+            <button id="btn-toggle-points" class="btn btn-sm btn-outline-light">Toggle points</button>
+          </div>
         </div>
-      </div>
 
-      <div id="map" class="map-canvas"></div>
+        <div id="map" class="map-canvas"></div>
 
-      <div class="map-legend glass-card">
-        <div class="legend-title">Legend</div>
-        <div class="legend-item"><span class="legend-dot dot-low"></span>Lower pressure</div>
-        <div class="legend-item"><span class="legend-dot dot-medium"></span>Medium pressure</div>
-        <div class="legend-item"><span class="legend-dot dot-high"></span>Higher pressure</div>
-      </div>
+        <div class="map-legend glass-card">
+          <div class="legend-title">Legend</div>
+          <div class="legend-item"><span class="legend-dot dot-low"></span>Lower pressure</div>
+          <div class="legend-item"><span class="legend-dot dot-medium"></span>Medium pressure</div>
+          <div class="legend-item"><span class="legend-dot dot-high"></span>Higher pressure</div>
+        </div>
+      </section>
     </main>
   </div>
 
