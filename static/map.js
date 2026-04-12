@@ -481,6 +481,16 @@ function popupHtml(point) {
     ? new Date(point.incident_datetime).toLocaleString() 
     : 'Unknown date';
 
+  const isActive = (point.resolution || '').toLowerCase().includes('open');
+
+  const statusLabel = isActive
+    ? '🔴 Active incident'
+    : '🟢 Resolved incident';
+
+  const riskContext = isActive
+    ? 'Active risk'
+    : 'Area risk';
+
   return `
     <div class="popup-card">
       <strong>${point.incident_category}</strong><br>
@@ -488,12 +498,10 @@ function popupHtml(point) {
       <span>${point.incident_subcategory}</span><br>
       <span>${point.police_district}</span><br>
 
-      <span>
-        ${point.resolution === 'Open' ? '🔴 Active' : '🟢 Resolved'}
-      </span><br>
+      <span>${statusLabel}</span><br>
 
       <span>
-        Risk (${point.risk_mode_label}): ${point.risk_level}
+        ${riskContext} (${point.risk_mode_label}): ${point.risk_level}
       </span><br>
 
       <small>${dt}</small>
