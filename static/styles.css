@@ -110,6 +110,7 @@ body {
   box-shadow: var(--shadow);
   backdrop-filter: blur(14px);
   padding: 18px;
+  z-index: 20;
 }
 
 .hero-card {
