@@ -16,7 +16,13 @@ const appState = {
     heat: null
   },
   pointsVisible: true,
-  isLoading: false
+  isLoading: false,
+  ui: {
+    mobileDrag: {
+      active: false,
+      pointerId: null
+    }
+  }
 };
 
 function buildQuery(params) {
@@ -84,6 +90,8 @@ function renderTrendChart(payload) {
   }
 
   const canvas = document.getElementById('trend-chart');
+  if (!canvas) return;
+
   const labels = payload.series.map((item) => {
     const dt = item.bucket ? new Date(item.bucket) : null;
     if (!dt || Number.isNaN(dt.getTime())) return 'n/a';
@@ -93,7 +101,10 @@ function renderTrendChart(payload) {
   });
   const values = payload.series.map((item) => Number(item.total_incidents || 0));
 
-  document.getElementById('trend-granularity').textContent = payload.granularity === 'daily' ? 'Daily series' : 'Hourly series';
+  const granularityEl = document.getElementById('trend-granularity');
+  if (granularityEl) {
+    granularityEl.textContent = payload.granularity === 'daily' ? 'Daily series' : 'Hourly series';
+  }
 
   if (appState.charts.trend) appState.charts.trend.destroy();
   appState.charts.trend = new Chart(canvas, {
@@ -134,6 +145,7 @@ function renderCategoryChart(payload) {
   }
 
   const canvas = document.getElementById('category-chart');
+  if (!canvas) return;
   if (appState.charts.category) appState.charts.category.destroy();
 
   appState.charts.category = new Chart(canvas, {
@@ -167,6 +179,7 @@ function riskBadgeClass(value) {
 
 function renderDistricts(items) {
   const container = document.getElementById('district-list');
+  if (!container) return;
   container.innerHTML = '';
 
   if (!Array.isArray(items) || items.length === 0) {
@@ -190,6 +203,7 @@ function renderDistricts(items) {
 
 function renderRiskSignals(items) {
   const container = document.getElementById('risk-signals');
+  if (!container) return;
   container.innerHTML = '';
 
   if (!Array.isArray(items) || items.length === 0) {
@@ -214,6 +228,8 @@ function renderRiskSignals(items) {
 
 function renderForecastSummary(summary) {
   const container = document.getElementById('forecast-summary');
+  if (!container) return;
+
   const minBucket = summary.min_bucket ? new Date(summary.min_bucket).toLocaleString() : 'n/a';
   const maxBucket = summary.max_bucket ? new Date(summary.max_bucket).toLocaleString() : 'n/a';
 
@@ -235,6 +251,8 @@ function renderForecastSummary(summary) {
 
 function setSelectOptions(selectId, options, selectedValue) {
   const select = document.getElementById(selectId);
+  if (!select) return;
+
   const current = selectedValue || 'all';
   select.innerHTML = '';
 
@@ -268,7 +286,9 @@ function riskColor(level) {
 
 function renderMap(payload) {
   const caption = document.getElementById('map-caption');
-  caption.textContent = `${Number(payload.point_count || 0)} geo incidents loaded`;
+  if (caption) {
+    caption.textContent = `${Number(payload.point_count || 0)} geo incidents loaded`;
+  }
 
   appState.layers.incidents.clearLayers();
   if (appState.layers.heat) {
@@ -278,12 +298,14 @@ function renderMap(payload) {
 
   const points = Array.isArray(payload.points) ? payload.points : [];
   const heatData = [];
+  const validLatLngs = [];
 
   points.forEach((point) => {
     const lat = Number(point.lat);
     const lon = Number(point.lon);
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
 
+    validLatLngs.push([lat, lon]);
     heatData.push([lat, lon, point.risk_level === 'high' ? 1 : point.risk_level === 'medium' ? 0.6 : 0.3]);
 
     const marker = L.circleMarker([lat, lon], {
@@ -311,10 +333,34 @@ function renderMap(payload) {
     appState.layers.incidents.addTo(appState.map);
   }
 
-  if (points.length > 0) {
-    const bounds = L.latLngBounds(points.map((point) => [Number(point.lat), Number(point.lon)]));
+  if (validLatLngs.length > 0) {
+    const bounds = L.latLngBounds(validLatLngs);
     appState.map.fitBounds(bounds.pad(0.08));
   }
+
+  requestMapResize();
+}
+
+function refreshVisualSizes() {
+  if (appState.map && typeof appState.map.invalidateSize === 'function') {
+    appState.map.invalidateSize();
+  }
+
+  if (appState.charts.trend) {
+    appState.charts.trend.resize();
+  }
+
+  if (appState.charts.category) {
+    appState.charts.category.resize();
+  }
+}
+
+function requestMapResize() {
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => {
+      refreshVisualSizes();
+    });
+  });
 }
 
 async function refreshFilters() {
@@ -350,6 +396,7 @@ async function refreshDashboard() {
     renderForecastSummary(forecastSummary || {});
 
     updateStatus('Live data connected');
+    requestMapResize();
   } catch (error) {
     console.error(error);
     updateStatus('Failed to load data', true);
@@ -359,87 +406,167 @@ async function refreshDashboard() {
 }
 
 function bindEvents() {
-  document.getElementById('time-window').addEventListener('change', (e) => {
+  document.getElementById('time-window')?.addEventListener('change', (e) => {
     appState.filters.window = e.target.value;
     appState.filters.district = 'all';
     appState.filters.category = 'all';
     refreshDashboard();
   });
 
-  document.getElementById('district-filter').addEventListener('change', (e) => {
+  document.getElementById('district-filter')?.addEventListener('change', (e) => {
     appState.filters.district = e.target.value;
     refreshDashboard();
   });
 
-  document.getElementById('category-filter').addEventListener('change', (e) => {
+  document.getElementById('category-filter')?.addEventListener('change', (e) => {
     appState.filters.category = e.target.value;
     refreshDashboard();
   });
 
-  document.getElementById('map-layer').addEventListener('change', (e) => {
+  document.getElementById('map-layer')?.addEventListener('change', (e) => {
     appState.filters.mapLayer = e.target.value;
     refreshDashboard();
   });
 
-  document.getElementById('risk-mode').addEventListener('change', (e) => {
+  document.getElementById('risk-mode')?.addEventListener('change', (e) => {
     appState.filters.riskMode = e.target.value;
     refreshDashboard();
   });
 
-  document.getElementById('reset-filters').addEventListener('click', () => {
-    appState.filters = { window: '7d', district: 'all', category: 'all', riskMode: 'volume', mapLayer: 'markers' };
-    document.getElementById('time-window').value = '7d';
-    document.getElementById('map-layer').value = 'markers';
-    document.getElementById('risk-mode').value = 'volume';
+  document.getElementById('reset-filters')?.addEventListener('click', () => {
+    appState.filters = {
+      window: '7d',
+      district: 'all',
+      category: 'all',
+      riskMode: 'volume',
+      mapLayer: 'markers'
+    };
+
+    const timeWindow = document.getElementById('time-window');
+    const mapLayer = document.getElementById('map-layer');
+    const riskMode = document.getElementById('risk-mode');
+
+    if (timeWindow) timeWindow.value = '7d';
+    if (mapLayer) mapLayer.value = 'markers';
+    if (riskMode) riskMode.value = 'volume';
+
     refreshDashboard();
   });
 
-  document.getElementById('btn-center-sf').addEventListener('click', () => {
+  document.getElementById('btn-center-sf')?.addEventListener('click', () => {
     appState.map.setView([37.7749, -122.4194], 12);
+    requestMapResize();
   });
 
-  document.getElementById('btn-toggle-points').addEventListener('click', () => {
+  document.getElementById('btn-toggle-points')?.addEventListener('click', () => {
     appState.pointsVisible = !appState.pointsVisible;
+
     if (appState.pointsVisible) {
-      if (!appState.map.hasLayer(appState.layers.incidents)) appState.layers.incidents.addTo(appState.map);
+      if (!appState.map.hasLayer(appState.layers.incidents) && appState.filters.mapLayer !== 'heat') {
+        appState.layers.incidents.addTo(appState.map);
+      }
     } else if (appState.map.hasLayer(appState.layers.incidents)) {
       appState.map.removeLayer(appState.layers.incidents);
     }
   });
+
+  window.addEventListener('resize', () => {
+    clampMobileSheetHeight();
+    requestMapResize();
+  });
+}
+
+function initCollapsibles() {
+  const cards = document.querySelectorAll('[data-collapsible]');
+
+  cards.forEach((card) => {
+    const btn = card.querySelector('.collapse-toggle');
+    const body = card.querySelector('.collapsible-body');
+    if (!btn || !body) return;
+
+    btn.addEventListener('click', () => {
+      const isCollapsed = card.classList.toggle('is-collapsed');
+      btn.textContent = isCollapsed ? 'Show' : 'Hide';
+      btn.setAttribute('aria-expanded', String(!isCollapsed));
+      requestMapResize();
+    });
+  });
+}
+
+function getMobileSheetLimits() {
+  const viewport = window.innerHeight;
+  const minMapHeight = Math.round(viewport * 0.10);
+  const maxMapHeight = Math.round(viewport * 0.88);
+  return { minMapHeight, maxMapHeight };
+}
+
+function setMobileMapHeight(px) {
+  const shell = document.getElementById('app-shell');
+  if (!shell) return;
+
+  const { minMapHeight, maxMapHeight } = getMobileSheetLimits();
+  const clamped = Math.max(minMapHeight, Math.min(maxMapHeight, Math.round(px)));
+  shell.style.setProperty('--mobile-map-height', `${clamped}px`);
+  requestMapResize();
+}
+
+function clampMobileSheetHeight() {
+  if (window.innerWidth > 991) return;
+
+  const shell = document.getElementById('app-shell');
+  if (!shell) return;
+
+  const raw = getComputedStyle(shell).getPropertyValue('--mobile-map-height').trim();
+  const current = Number.parseFloat(raw);
+
+  if (Number.isFinite(current)) {
+    setMobileMapHeight(current);
+  }
 }
 
 function initDragHandle() {
   const handle = document.getElementById('drag-handle');
-  const shell = document.getElementById('app-shell');
-  let dragging = false;
+  if (!handle) return;
 
-  const move = (clientY) => {
+  const onPointerMove = (event) => {
+    if (!appState.ui.mobileDrag.active) return;
     if (window.innerWidth > 991) return;
-    const topHeight = Math.max(220, Math.min(window.innerHeight - 260, clientY));
-    shell.style.setProperty('--mobile-map-height', `${topHeight}px`);
-    setTimeout(() => appState.map.invalidateSize(), 0);
+    setMobileMapHeight(event.clientY);
   };
 
-  handle.addEventListener('touchstart', () => { dragging = true; }, { passive: true });
-  handle.addEventListener('touchend', () => { dragging = false; }, { passive: true });
-  handle.addEventListener('touchmove', (e) => {
-    if (!dragging) return;
-    move(e.touches[0].clientY);
-  }, { passive: true });
+  const stopDrag = () => {
+    appState.ui.mobileDrag.active = false;
+    appState.ui.mobileDrag.pointerId = null;
+    document.body.style.userSelect = '';
+    document.body.style.touchAction = '';
 
-  handle.addEventListener('mousedown', () => { dragging = true; });
-  window.addEventListener('mouseup', () => { dragging = false; });
-  window.addEventListener('mousemove', (e) => {
-    if (!dragging) return;
-    move(e.clientY);
+    window.removeEventListener('pointermove', onPointerMove);
+    window.removeEventListener('pointerup', stopDrag);
+    window.removeEventListener('pointercancel', stopDrag);
+  };
+
+  handle.addEventListener('pointerdown', (event) => {
+    if (window.innerWidth > 991) return;
+
+    appState.ui.mobileDrag.active = true;
+    appState.ui.mobileDrag.pointerId = event.pointerId;
+    document.body.style.userSelect = 'none';
+    document.body.style.touchAction = 'none';
+
+    window.addEventListener('pointermove', onPointerMove, { passive: true });
+    window.addEventListener('pointerup', stopDrag);
+    window.addEventListener('pointercancel', stopDrag);
   });
 }
 
 async function init() {
   initMap();
   bindEvents();
+  initCollapsibles();
   initDragHandle();
+  clampMobileSheetHeight();
   await refreshDashboard();
+  requestMapResize();
 }
 
 document.addEventListener('DOMContentLoaded', init);
