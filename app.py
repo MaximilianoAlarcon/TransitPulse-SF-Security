@@ -33,6 +33,33 @@ SF_CENTER = {"lat": 37.7749, "lon": -122.4194}
 MAP_POINT_LIMIT = 600
 
 
+CATEGORY_FILTER_VALUES = [
+    "Larceny Theft",
+    "Drug Offense",
+    "Drug Violation",
+    "Assault",
+    "Malicious Mischief",
+    "Burglary",
+    "Motor Vehicle Theft",
+    "Disorderly Conduct",
+    "Fraud",
+    "Robbery",
+    "Offences Against The Family And Children",
+    "Weapons Offense",
+    "Weapons Carrying Etc",
+    "Forgery And Counterfeiting",
+    "Arson",
+    "Stolen Property",
+    "Vandalism",
+    "Embezzlement",
+    "Liquor Laws",
+    "Prostitution",
+    "Homicide",
+    "Gambling",
+    "Sex Offense",
+]
+
+
 def fetch_all_dict(query: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
     with get_db_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -486,7 +513,9 @@ def api_dashboard_map_points():
         risk_mode = "volume"
 
     where_clause, params = apply_common_filters("r", filters, "incident_datetime")
-    params = params + (MAP_POINT_LIMIT,)
+
+    category_placeholders = ", ".join(["%s"] * len(CATEGORY_FILTER_VALUES))
+    params = params + tuple(CATEGORY_FILTER_VALUES) + (MAP_POINT_LIMIT,)
 
     rows = fetch_all_dict(
         f"""
@@ -503,6 +532,7 @@ def api_dashboard_map_points():
             r.longitude
         FROM incidents_raw r
         WHERE {where_clause}
+          AND r.incident_category IN ({category_placeholders})
           AND r.latitude IS NOT NULL
           AND r.longitude IS NOT NULL
         ORDER BY r.incident_datetime DESC

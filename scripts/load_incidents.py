@@ -337,7 +337,7 @@ def load_incidents() -> None:
 
     upsert_rows(rows)
 
-    backfill_limit = int(os.environ.get("BACKFILL_MISSING_COORDS_LIMIT", "10000"))
+    backfill_limit = int(os.environ.get("BACKFILL_MISSING_COORDS_LIMIT", "0"))
     if backfill_limit > 0:
         backfill_missing_coordinates(limit=backfill_limit)
 
