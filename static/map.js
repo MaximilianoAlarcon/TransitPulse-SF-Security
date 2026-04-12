@@ -618,6 +618,9 @@ async function refreshDashboard() {
       apiGet('/api/dashboard/forecast-training-summary', getCommonParams())
     ]);
 
+    console.log("mapData")
+    console.log(mapData)
+
     updateKPIs(overview.kpis || {});
     renderTrendChart(trend);
     renderDistricts(districts.districts || []);
