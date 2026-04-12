@@ -94,6 +94,52 @@ def apply_common_filters(alias: str, filters: dict[str, Any], timestamp_column: 
     return " AND ".join(conditions), tuple(params)
 
 
+
+
+def is_open_resolution(value: Any) -> bool:
+    text = (value or "").strip().lower()
+    return text.startswith("open") or text.startswith("active")
+
+
+def category_base_score(category: str) -> float:
+    normalized = (category or "").strip().lower()
+    high_keywords = ["assault", "robbery", "burglary", "weapon", "homicide", "arson", "sex offense"]
+    medium_keywords = ["theft", "larceny", "fraud", "motor vehicle theft", "stolen property", "vandalism", "malicious mischief"]
+    low_keywords = ["drug", "disorderly", "liquor", "gambling", "prostitution"]
+
+    if any(keyword in normalized for keyword in high_keywords):
+        return 0.9
+    if any(keyword in normalized for keyword in medium_keywords):
+        return 0.6
+    if any(keyword in normalized for keyword in low_keywords):
+        return 0.35
+    return 0.3
+
+
+def compute_point_risk(row: dict[str, Any], risk_mode: str) -> tuple[float, str]:
+    base_score = category_base_score(row.get("incident_category") or "Unknown")
+    resolution = row.get("resolution")
+    delay_minutes = float(row.get("report_delay_minutes") or 0)
+
+    if risk_mode == "open":
+        score = 0.85 if is_open_resolution(resolution) else max(0.25, base_score * 0.55)
+        label = "Open / Active"
+    elif risk_mode == "delay":
+        if delay_minutes >= 180:
+            score = 0.9
+        elif delay_minutes >= 90:
+            score = 0.65
+        elif delay_minutes >= 30:
+            score = 0.45
+        else:
+            score = 0.25
+        label = "Report delay"
+    else:
+        score = base_score
+        label = "Volume"
+
+    return max(0.0, min(1.0, score)), label
+
 @app.route("/")
 def dashboard():
     return render_template("index.html")
@@ -440,33 +486,6 @@ def api_dashboard_map_points():
         risk_mode = "volume"
 
     where_clause, params = apply_common_filters("r", filters, "incident_datetime")
-
-    risk_where, risk_params = apply_common_filters("rf", filters, "feature_timestamp")
-    risk_rows = fetch_all_dict(
-        f"""
-        SELECT
-            rf.police_district,
-            rf.incident_category,
-            AVG(rf.incidents_last_24h) AS volume_score,
-            AVG(rf.open_active_ratio_24h) AS open_score,
-            AVG(rf.avg_report_delay_minutes_24h) AS delay_score
-        FROM risk_features_hourly rf
-        WHERE {risk_where}
-        GROUP BY rf.police_district, rf.incident_category;
-        """,
-        risk_params,
-    )
-
-    risk_lookup: dict[tuple[str, str], dict[str, float]] = {}
-    for row in risk_rows:
-        district_key = row.get("police_district") or "Unknown"
-        category_key = row.get("incident_category") or "Unknown"
-        risk_lookup[(district_key, category_key)] = {
-            "volume": float(row.get("volume_score") or 0.0),
-            "open": float(row.get("open_score") or 0.0),
-            "delay": float(row.get("delay_score") or 0.0),
-        }
-
     params = params + (MAP_POINT_LIMIT,)
 
     rows = fetch_all_dict(
@@ -479,6 +498,7 @@ def api_dashboard_map_points():
             r.incident_subcategory,
             r.incident_description,
             r.resolution,
+            r.report_delay_minutes,
             r.latitude,
             r.longitude
         FROM incidents_raw r
@@ -491,73 +511,28 @@ def api_dashboard_map_points():
         params,
     )
 
-    def classify_risk(score: float, mode: str) -> str:
-        if mode == "open":
-            if score >= 0.40:
-                return "high"
-            if score >= 0.20:
-                return "medium"
-            return "low"
-        if mode == "delay":
-            if score >= 120:
-                return "high"
-            if score >= 45:
-                return "medium"
-            return "low"
-        if score >= 12:
-            return "high"
-        if score >= 4:
-            return "medium"
-        return "low"
-
-    def heat_weight(score: float, level: str, mode: str) -> float:
-        if mode == "open":
-            return min(max(score, 0.12), 1.0)
-        if mode == "delay":
-            return min(max(score / 180.0, 0.12), 1.0)
-        if score <= 0:
-            return 0.12 if level == "low" else 0.2
-        return min(max(score / 18.0, 0.18), 1.0)
-
-    def marker_radius(level: str, score: float, mode: str) -> float:
-        if level == "high":
-            return 7.5 if mode != "delay" else 8.0
-        if level == "medium":
-            return 6.0
-        return 4.5
-
     points = []
     for row in rows:
-        district_key = row.get("police_district") or "Unknown"
-        category_key = row.get("incident_category") or "Unknown"
-        scores = risk_lookup.get((district_key, category_key), {"volume": 0.0, "open": 0.0, "delay": 0.0})
-        selected_score = float(scores.get(risk_mode) or 0.0)
-        level = classify_risk(selected_score, risk_mode)
-
+        risk_score, risk_mode_label = compute_point_risk(row, risk_mode)
         points.append(
             {
                 "id": row.get("row_id"),
                 "lat": float(row["latitude"]),
                 "lon": float(row["longitude"]),
-                "police_district": district_key,
-                "incident_category": category_key,
+                "police_district": row.get("police_district") or "Unknown",
+                "incident_category": row.get("incident_category") or "Unknown",
                 "incident_subcategory": row.get("incident_subcategory") or "Unknown",
                 "incident_description": row.get("incident_description") or "No description",
                 "resolution": row.get("resolution") or "Unknown",
                 "incident_datetime": row["incident_datetime"].isoformat() if row.get("incident_datetime") else None,
-                "risk_level": level,
-                "risk_score": round(selected_score, 2),
+                "risk_score": risk_score,
+                "risk_level": "high" if risk_score >= 0.7 else "medium" if risk_score >= 0.4 else "low",
                 "risk_mode": risk_mode,
-                "heat_weight": round(heat_weight(selected_score, level, risk_mode), 3),
-                "marker_radius": marker_radius(level, selected_score, risk_mode),
+                "risk_mode_label": risk_mode_label,
+                "marker_radius": 8 if risk_score >= 0.85 else 7 if risk_score >= 0.65 else 6 if risk_score >= 0.45 else 4.5,
+                "heat_weight": risk_score,
             }
         )
-
-    risk_mode_label = {
-        "volume": "Volume",
-        "open": "Open / Active",
-        "delay": "Report delay",
-    }[risk_mode]
 
     return jsonify(
         {
@@ -565,7 +540,6 @@ def api_dashboard_map_points():
             "center": SF_CENTER,
             "point_count": len(points),
             "risk_mode": risk_mode,
-            "risk_mode_label": risk_mode_label,
             "points": points,
         }
     )

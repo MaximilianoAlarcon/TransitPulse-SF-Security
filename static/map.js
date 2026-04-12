@@ -15,9 +15,14 @@ const appState = {
     incidents: null,
     heat: null
   },
+  mapData: {
+    points: [],
+    center: null,
+    pointCount: 0,
+    riskMode: 'volume'
+  },
   pointsVisible: true,
   isLoading: false,
-  mapData: null,
   ui: {
     mobileDrag: {
       active: false,
@@ -52,6 +57,13 @@ function getCommonParams() {
     window: appState.filters.window,
     district: appState.filters.district,
     category: appState.filters.category
+  };
+}
+
+function getMapParams() {
+  return {
+    ...getCommonParams(),
+    risk_mode: appState.filters.riskMode
   };
 }
 
@@ -430,37 +442,72 @@ function initCustomSelects() {
   });
 }
 
+
+function getScoreColor(score) {
+  if (score >= 0.7) return '#ff6b6b';
+  if (score >= 0.4) return '#f7b267';
+  return '#66c7f4';
+}
+
+function getMarkerRadius(score) {
+  if (score >= 0.85) return 8;
+  if (score >= 0.65) return 7;
+  if (score >= 0.45) return 6;
+  return 4.5;
+}
+
+function getHeatWeight(score) {
+  return Math.max(0.15, Math.min(1, score));
+}
+
+function updateMapCaption() {
+  const caption = document.getElementById('map-caption');
+  if (!caption) return;
+  const layerLabel = appState.filters.mapLayer === 'heat' ? 'Density view' : 'Incidents';
+  const riskLabelMap = {
+    volume: 'Volume',
+    open: 'Open / Active',
+    delay: 'Report delay'
+  };
+  const riskLabel = riskLabelMap[appState.filters.riskMode] || 'Volume';
+  caption.textContent = `${layerLabel} · ${riskLabel} · ${formatNumber(appState.mapData.pointCount || 0)} points`;
+}
+
 function popupHtml(point) {
   const dt = point.incident_datetime ? new Date(point.incident_datetime).toLocaleString() : 'Unknown date';
-  const riskMode = point.risk_mode === 'open'
-    ? 'Open / Active'
-    : point.risk_mode === 'delay'
-      ? 'Report delay'
-      : 'Volume';
-  const riskScore = Number(point.risk_score || 0);
-  const riskSuffix = point.risk_mode === 'open' ? '%' : point.risk_mode === 'delay' ? ' min' : '';
-  const displayScore = point.risk_mode === 'open' ? (riskScore * 100).toFixed(1) : riskScore.toFixed(1);
-
+  const scorePct = `${formatNumber((Number(point.risk_score || 0) * 100), 0)}%`;
+  const riskModeLabel = point.risk_mode_label || 'Volume';
   return `
     <div class="popup-card">
       <strong>${point.incident_category}</strong><br>
       <span>${point.incident_subcategory}</span><br>
       <span>${point.police_district}</span><br>
       <span>${point.resolution}</span><br>
-      <span>${riskMode}: ${displayScore}${riskSuffix}</span><br>
+      <span>${riskModeLabel}: ${scorePct}</span><br>
       <small>${dt}</small>
     </div>
   `;
 }
 
 function riskColor(level) {
+  if (typeof level === 'number') {
+    return getScoreColor(level);
+  }
   if (level === 'high') return '#ff6b6b';
   if (level === 'medium') return '#f7b267';
   return '#66c7f4';
 }
 
 function renderMap(payload) {
-  appState.mapData = payload || {};
+  const points = Array.isArray(payload?.points) ? payload.points : [];
+  appState.mapData = {
+    points,
+    center: payload?.center || null,
+    pointCount: Number(payload?.point_count || points.length || 0),
+    riskMode: payload?.risk_mode || appState.filters.riskMode
+  };
+
+  updateMapCaption();
 
   appState.layers.incidents.clearLayers();
   if (appState.layers.heat) {
@@ -468,7 +515,6 @@ function renderMap(payload) {
     appState.layers.heat = null;
   }
 
-  const points = Array.isArray(appState.mapData.points) ? appState.mapData.points : [];
   const heatData = [];
   const validLatLngs = [];
 
@@ -477,48 +523,44 @@ function renderMap(payload) {
     const lon = Number(point.lon);
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
 
-    const markerRadius = Number(point.marker_radius || 5);
-    const heatWeight = Number(point.heat_weight || 0.35);
-
+    const score = Math.max(0, Math.min(1, Number(point.risk_score ?? 0)));
     validLatLngs.push([lat, lon]);
-    heatData.push([lat, lon, heatWeight]);
+    heatData.push([lat, lon, Number(point.heat_weight || getHeatWeight(score))]);
 
     const marker = L.circleMarker([lat, lon], {
-      radius: markerRadius,
-      color: riskColor(point.risk_level),
+      radius: Number(point.marker_radius || getMarkerRadius(score)),
+      color: getScoreColor(score),
       weight: 1,
-      fillColor: riskColor(point.risk_level),
-      fillOpacity: 0.76
+      fillColor: getScoreColor(score),
+      fillOpacity: 0.72
     }).bindPopup(popupHtml(point));
 
     appState.layers.incidents.addLayer(marker);
   });
 
-  const caption = document.getElementById('map-caption');
-  if (caption) {
-    const modeLabel = appState.mapData.risk_mode_label || 'Volume';
-    const layerLabel = appState.filters.mapLayer === 'heat' ? 'Heatmap' : 'Markers';
-    caption.textContent = `${Number(appState.mapData.point_count || 0)} incidents · ${layerLabel} · Risk mode: ${modeLabel}`;
-  }
-
   if (appState.filters.mapLayer === 'heat' && heatData.length > 0) {
     appState.layers.heat = L.heatLayer(heatData, {
-      radius: 26,
-      blur: 24,
-      maxZoom: 15,
-      minOpacity: 0.35
+      radius: 22,
+      blur: 20,
+      maxZoom: 15
     }).addTo(appState.map);
 
     if (appState.map.hasLayer(appState.layers.incidents)) {
       appState.map.removeLayer(appState.layers.incidents);
     }
-  } else if (appState.pointsVisible && !appState.map.hasLayer(appState.layers.incidents)) {
-    appState.layers.incidents.addTo(appState.map);
+  } else if (appState.pointsVisible) {
+    if (!appState.map.hasLayer(appState.layers.incidents)) {
+      appState.layers.incidents.addTo(appState.map);
+    }
+  } else if (appState.map.hasLayer(appState.layers.incidents)) {
+    appState.map.removeLayer(appState.layers.incidents);
   }
 
   if (validLatLngs.length > 0) {
     const bounds = L.latLngBounds(validLatLngs);
     appState.map.fitBounds(bounds.pad(0.08));
+  } else if (payload?.center) {
+    appState.map.setView([payload.center.lat, payload.center.lon], 12);
   }
 
   requestMapResize();
@@ -566,7 +608,7 @@ async function refreshDashboard() {
       apiGet('/api/dashboard/district-pressure', getCommonParams()),
       apiGet('/api/dashboard/category-mix', getCommonParams()),
       apiGet('/api/dashboard/risk-signals', { ...getCommonParams(), risk_mode: appState.filters.riskMode }),
-      apiGet('/api/dashboard/map-points', { ...getCommonParams(), risk_mode: appState.filters.riskMode }),
+      apiGet('/api/dashboard/map-points', getMapParams()),
       apiGet('/api/dashboard/forecast-training-summary', getCommonParams())
     ]);
 
@@ -608,11 +650,12 @@ function bindEvents() {
 
   document.getElementById('map-layer')?.addEventListener('change', (e) => {
     appState.filters.mapLayer = e.target.value;
-    if (appState.mapData) {
-      renderMap(appState.mapData);
-    } else {
-      refreshDashboard();
-    }
+    renderMap({
+      points: appState.mapData.points,
+      center: appState.mapData.center,
+      point_count: appState.mapData.pointCount,
+      risk_mode: appState.filters.riskMode
+    });
   });
 
   document.getElementById('risk-mode')?.addEventListener('change', (e) => {
@@ -630,23 +673,14 @@ function bindEvents() {
     };
 
     const timeWindow = document.getElementById('time-window');
+    const districtFilter = document.getElementById('district-filter');
+    const categoryFilter = document.getElementById('category-filter');
     const mapLayer = document.getElementById('map-layer');
     const riskMode = document.getElementById('risk-mode');
 
     if (timeWindow) {
       timeWindow.value = '7d';
       syncCustomSelect(timeWindow);
-    }
-    const districtFilter = document.getElementById('district-filter');
-    const categoryFilter = document.getElementById('category-filter');
-
-    if (mapLayer) {
-      mapLayer.value = 'markers';
-      syncCustomSelect(mapLayer);
-    }
-    if (riskMode) {
-      riskMode.value = 'volume';
-      syncCustomSelect(riskMode);
     }
     if (districtFilter) {
       districtFilter.value = 'all';
@@ -655,6 +689,14 @@ function bindEvents() {
     if (categoryFilter) {
       categoryFilter.value = 'all';
       syncCustomSelect(categoryFilter);
+    }
+    if (mapLayer) {
+      mapLayer.value = 'markers';
+      syncCustomSelect(mapLayer);
+    }
+    if (riskMode) {
+      riskMode.value = 'volume';
+      syncCustomSelect(riskMode);
     }
 
     refreshDashboard();
@@ -667,8 +709,13 @@ function bindEvents() {
 
   document.getElementById('btn-toggle-points')?.addEventListener('click', () => {
     appState.pointsVisible = !appState.pointsVisible;
-    if (appState.mapData) {
-      renderMap(appState.mapData);
+
+    if (appState.pointsVisible) {
+      if (!appState.map.hasLayer(appState.layers.incidents) && appState.filters.mapLayer !== 'heat') {
+        appState.layers.incidents.addTo(appState.map);
+      }
+    } else if (appState.map.hasLayer(appState.layers.incidents)) {
+      appState.map.removeLayer(appState.layers.incidents);
     }
   });
 
