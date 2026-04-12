@@ -1,3 +1,4 @@
+import json
 import os
 import sys
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -7,7 +8,33 @@ if PROJECT_ROOT not in sys.path:
 
 from utils import execute_etl_query
 
-SQL = """
+
+def load_category_filter() -> list[str]:
+    raw = os.environ.get("CATEGORY_FILTER_VALUES_JSON", "[]")
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        parsed = []
+    return [str(item).strip() for item in parsed if str(item).strip()]
+
+
+def sql_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def build_category_condition(alias: str) -> str:
+    categories = load_category_filter()
+    if not categories:
+        return ""
+    values = ", ".join(sql_quote(category) for category in categories)
+    return f"\n      AND COALESCE({alias}.incident_category, 'Unknown') IN ({values})"
+
+
+HOURLY_CATEGORY_CONDITION = build_category_condition("ich")
+DELAY_CATEGORY_CONDITION = build_category_condition("r")
+FEATURE_CATEGORY_CONDITION = build_category_condition("h")
+
+SQL = f"""
 BEGIN;
 
 DELETE FROM risk_features_hourly
@@ -18,8 +45,8 @@ WITH feature_hours AS (
         bucket_start AS feature_timestamp,
         police_district,
         incident_category
-    FROM incident_counts_hourly
-    WHERE bucket_start >= date_trunc('hour', NOW() - INTERVAL '48 hours')
+    FROM incident_counts_hourly h
+    WHERE bucket_start >= date_trunc('hour', NOW() - INTERVAL '48 hours'){FEATURE_CATEGORY_CONDITION}
 ),
 delay_hourly AS (
     SELECT
@@ -28,9 +55,9 @@ delay_hourly AS (
         COALESCE(incident_category, 'Unknown') AS incident_category,
         SUM(report_delay_minutes) AS sum_report_delay_minutes,
         COUNT(report_delay_minutes) AS count_report_delay_minutes
-    FROM incidents_raw
+    FROM incidents_raw r
     WHERE incident_datetime IS NOT NULL
-      AND incident_datetime >= date_trunc('hour', NOW() - INTERVAL '9 days')
+      AND incident_datetime >= date_trunc('hour', NOW() - INTERVAL '9 days'){DELAY_CATEGORY_CONDITION}
     GROUP BY 1,2,3
 )
 
@@ -142,7 +169,7 @@ LEFT JOIN incident_counts_hourly ich
     ON ich.police_district = fh.police_district
    AND ich.incident_category = fh.incident_category
    AND ich.bucket_start >= fh.feature_timestamp - INTERVAL '6 days'
-   AND ich.bucket_start <  fh.feature_timestamp + INTERVAL '1 hour'
+   AND ich.bucket_start <  fh.feature_timestamp + INTERVAL '1 hour'{HOURLY_CATEGORY_CONDITION}
 LEFT JOIN delay_hourly dh
     ON dh.police_district = fh.police_district
    AND dh.incident_category = fh.incident_category
