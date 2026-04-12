@@ -110,7 +110,6 @@ body {
   box-shadow: var(--shadow);
   backdrop-filter: blur(14px);
   padding: 18px;
-  z-index: 20;
 }
 
 .hero-card {
@@ -202,6 +201,7 @@ body {
   flex-direction: column;
   gap: 6px;
   min-height: 128px;
+  z-index: 20;
 }
 
 .kpi-label {
