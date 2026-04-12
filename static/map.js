@@ -477,16 +477,25 @@ function updateMapCaption() {
 }
 
 function popupHtml(point) {
-  const dt = point.incident_datetime ? new Date(point.incident_datetime).toLocaleString() : 'Unknown date';
-  const scorePct = `${formatNumber((Number(point.risk_score || 0) * 100), 0)}%`;
-  const riskModeLabel = point.risk_mode_label || 'Volume';
+  const dt = point.incident_datetime 
+    ? new Date(point.incident_datetime).toLocaleString() 
+    : 'Unknown date';
+
   return `
     <div class="popup-card">
       <strong>${point.incident_category}</strong><br>
+
       <span>${point.incident_subcategory}</span><br>
       <span>${point.police_district}</span><br>
-      <span>${point.resolution}</span><br>
-      <span>${riskModeLabel}: ${scorePct}</span><br>
+
+      <span>
+        ${point.resolution === 'Open' ? '🔴 Active' : '🟢 Resolved'}
+      </span><br>
+
+      <span>
+        Risk (${point.risk_mode_label}): ${point.risk_level}
+      </span><br>
+
       <small>${dt}</small>
     </div>
   `;
