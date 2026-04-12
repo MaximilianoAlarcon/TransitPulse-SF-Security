@@ -463,6 +463,7 @@ function getHeatWeight(score) {
 function updateMapCaption() {
   const caption = document.getElementById('map-caption');
   if (!caption) return;
+  console.log("Updating caption")
   const layerLabel = appState.filters.mapLayer === 'heat' ? 'Density view' : 'Incidents';
   const riskLabelMap = {
     volume: 'Volume',
@@ -470,6 +471,8 @@ function updateMapCaption() {
     delay: 'Report delay'
   };
   const riskLabel = riskLabelMap[appState.filters.riskMode] || 'Volume';
+  console.log("riskLabel")
+  console.log(riskLabel)
   caption.textContent = `${layerLabel} · ${riskLabel} · ${formatNumber(appState.mapData.pointCount || 0)} points`;
 }
 
@@ -499,7 +502,10 @@ function riskColor(level) {
 }
 
 function renderMap(payload) {
+  console.log("Redering")
   const points = Array.isArray(payload?.points) ? payload.points : [];
+  console.log("points")
+  console.log(points)
   appState.mapData = {
     points,
     center: payload?.center || null,
