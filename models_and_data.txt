@@ -1,0 +1,606 @@
+-----------------------MODELOS-----------------------
+
+1) Predicción de volumen de incidentes (Time Series Forecasting)
+Input
+-----
+{
+  "timestamp": "2026-02-21 08:00:00",
+  "district": "Mission",
+  "category": "Larceny Theft",
+  "count": 12
+}
+Output
+------
+{
+  "expected_incidents_next_hour": 15,
+  "confidence_interval": [10, 20]
+}
+
+2) Clasificación de nivel de riesgo
+Input
+-----
+{
+  "hour": 20,
+  "day_of_week": "Saturday",
+  "district": "Mission",
+  "recent_incidents_1h": 18,
+  "recent_incidents_24h": 120,
+  "category_frequency_24h": 45,
+  "open_cases_ratio": 0.65,
+  "online_report_ratio": 0.4
+}
+Output
+------
+{
+  "risk_level": "High",
+  "risk_score": 0.82
+}
+
+3) Clustering de zonas (detección de “hotspots”)
+Input
+-----
+{
+  "lat": 37.7749,
+  "lon": -122.4194,
+  "timestamp": "2026-02-21T08:00:00",
+  "category": "Larceny Theft"
+}
+------
+{
+  "cluster_id": 3,
+  "cluster_density": 0.87,
+  "is_hotspot": true
+}
+
+4) Modelo de riesgo sobre rutas (feature engineering + ML)
+Input
+-----
+{
+  "incidents_near_route": 25,
+  "incidents_last_24h": 10,
+  "incidents_last_7d": 80,
+  "theft_ratio": 0.6,
+  "night_ratio": 0.7,
+  "avg_distance_to_route": 120,
+  "max_density_segment": 8,
+  "hour": 21,
+  "day_of_week": "Saturday"
+}
+Output
+------
+{
+  "risk_score": 0.72,
+  "risk_level": "Medium"
+}
+
+5) Detección de anomalías
+Input
+-----
+[
+  {"t": "08:00", "count": 12},
+  {"t": "09:00", "count": 10},
+  {"t": "10:00", "count": 35}
+]
+Output
+------
+{
+  "anomaly": true,
+  "severity": "high",
+  "expected_range": [8, 15],
+  "actual": 35
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+-----------------------TABLAS-----------------------
+Para cubrir todos esos modelos, conviene separar las tablas en 3 capas:
+
+raw ingestion
+features agregadas
+predicciones / resultados de modelos
+
+Y sí, varias necesitan actualización constante, pero no todas con la misma frecuencia.
+
+Te lo dejo ordenado por tabla y por modelo.
+
+1. Tabla base obligatoria
+incidents_raw
+
+Guarda cada incidente tal como viene de la API, más algunos campos normalizados.
+
+Columnas
+incidents_raw (
+    row_id text primary key,
+    incident_datetime timestamp,
+    incident_date date,
+    incident_time time,
+    incident_year int,
+    incident_day_of_week text,
+    report_datetime timestamp,
+    incident_id text,
+    incident_number text,
+    report_type_code text,
+    report_type_description text,
+    filed_online boolean,
+    incident_code text,
+    incident_category text,
+    incident_subcategory text,
+    incident_description text,
+    resolution text,
+    police_district text,
+    data_as_of timestamp,
+    data_loaded_at timestamp,
+
+    -- derivados útiles
+    incident_hour int,
+    report_delay_minutes int,
+
+    -- geografía si existe en otra versión del dataset
+    latitude double precision,
+    longitude double precision,
+    geom geometry(Point, 4326)
+)
+Para qué sirve
+
+Base para todos los modelos.
+
+Actualización
+
+Sí, constante.
+Idealmente:
+
+cada hora
+o una vez por día para MVP
+2. Tablas de agregación temporal
+
+Estas son las más importantes para forecasting, riesgo y anomalías.
+
+incident_counts_hourly
+
+Agregado por hora.
+
+Columnas
+incident_counts_hourly (
+    bucket_start timestamp,
+    police_district text,
+    incident_category text,
+    incident_subcategory text,
+    total_incidents int,
+    open_active_count int,
+    filed_online_count int
+)
+Derivadas
+open_active_ratio = open_active_count / total_incidents
+filed_online_ratio = filed_online_count / total_incidents
+Para qué modelos
+predicción de volumen
+clasificación de nivel de riesgo
+detección de anomalías
+Actualización
+
+Sí, constante.
+Cada vez que cargas nuevos incidentes, recalculás:
+
+última hora
+últimas 24/48 horas por seguridad
+incident_counts_daily
+
+Agregado por día.
+
+Columnas
+incident_counts_daily (
+    bucket_date date,
+    police_district text,
+    incident_category text,
+    incident_subcategory text,
+    total_incidents int,
+    open_active_count int,
+    filed_online_count int
+)
+Para qué modelos
+forecasting diario
+tendencia
+anomalías
+features históricas
+Actualización
+
+Sí, diaria.
+
+3. Tablas de features temporales para ML
+
+Estas ya no son “raw” ni simples agregados; son datasets listos para entrenar.
+
+risk_features_hourly
+
+Una fila por combinación de hora + distrito + categoría.
+
+Columnas
+risk_features_hourly (
+    feature_timestamp timestamp,
+    police_district text,
+    incident_category text,
+
+    hour_of_day int,
+    day_of_week text,
+    month_of_year int,
+
+    incidents_last_1h int,
+    incidents_last_3h int,
+    incidents_last_6h int,
+    incidents_last_24h int,
+    incidents_last_7d int,
+
+    open_active_ratio_24h double precision,
+    filed_online_ratio_24h double precision,
+
+    avg_report_delay_minutes_24h double precision,
+
+    -- target opcional para entrenamiento
+    target_risk_level text,
+    target_risk_score double precision
+)
+Para qué modelos
+clasificación de nivel de riesgo
+anomalías
+incluso forecasting tabular con XGBoost
+Actualización
+
+Sí.
+Ideal:
+
+cada hora
+forecast_training_series
+
+Si querés separar claramente el dataset de forecasting.
+
+Columnas
+forecast_training_series (
+    series_id text,
+    bucket_start timestamp,
+    police_district text,
+    incident_category text,
+    total_incidents int
+)
+
+series_id puede ser algo como:
+
+Mission|Larceny Theft
+Para qué modelos
+ARIMA
+Prophet
+LSTM
+Actualización
+
+Sí, constante.
+
+4. Tablas espaciales
+
+Solo si dispones de lat/lon o point.
+
+incident_hotspots
+
+Resultado de clustering espacial.
+
+Columnas
+incident_hotspots (
+    hotspot_id bigserial primary key,
+    computed_at timestamp,
+    incident_category text,
+    time_window_start timestamp,
+    time_window_end timestamp,
+
+    cluster_label int,
+    point_count int,
+    centroid geometry(Point, 4326),
+    hotspot_geom geometry(Polygon, 4326),
+    density_score double precision,
+    is_hotspot boolean
+)
+Para qué modelos
+clustering de zonas
+mapa de hotspots
+input parcial para riesgo de rutas
+Actualización
+
+Sí, pero no hace falta cada minuto.
+Con:
+
+1 vez por día
+o cada 6 horas
+alcanza para MVP.
+spatial_grid_features
+
+Muy recomendable.
+
+En vez de depender solo de clusters, dividís SF en celdas.
+
+Columnas
+spatial_grid_features (
+    grid_id text,
+    grid_geom geometry(Polygon, 4326),
+
+    snapshot_timestamp timestamp,
+
+    incidents_last_24h int,
+    incidents_last_7d int,
+    theft_ratio_7d double precision,
+    assault_ratio_7d double precision,
+    open_active_ratio_7d double precision,
+    night_incidents_ratio_7d double precision
+)
+Para qué modelos
+clasificación de riesgo
+modelo de riesgo sobre rutas
+anomalías espaciales
+mapas
+Actualización
+
+Sí.
+Frecuencia:
+
+diaria o cada pocas horas
+5. Tablas para rutas
+
+Estas no salen de la API de incidentes; son para combinar con OTP o con tus rutas.
+
+route_requests
+
+Guarda rutas evaluadas.
+
+Columnas
+route_requests (
+    route_id bigserial primary key,
+    requested_at timestamp,
+    origin_lat double precision,
+    origin_lon double precision,
+    dest_lat double precision,
+    dest_lon double precision,
+    route_geom geometry(LineString, 4326),
+    travel_hour int,
+    travel_day_of_week text
+)
+Para qué modelos
+riesgo sobre rutas
+auditoría
+reentrenamiento
+Actualización
+
+Sí, si tu app evalúa rutas en producción.
+Si no, la podés poblar con rutas sintéticas.
+
+route_risk_features
+
+Dataset listo para el modelo de riesgo sobre rutas.
+
+Columnas
+route_risk_features (
+    route_feature_id bigserial primary key,
+    route_id bigint,
+
+    computed_at timestamp,
+
+    travel_hour int,
+    travel_day_of_week text,
+
+    incidents_near_route_100m_24h int,
+    incidents_near_route_250m_24h int,
+    incidents_near_route_500m_24h int,
+
+    incidents_near_route_7d int,
+    theft_ratio_near_route_7d double precision,
+    assault_ratio_near_route_7d double precision,
+    night_ratio_near_route_7d double precision,
+
+    avg_distance_incidents_m double precision,
+    max_segment_density double precision,
+
+    -- target
+    target_risk_score double precision,
+    target_risk_level text
+)
+Para qué modelos
+modelo de riesgo sobre rutas
+Actualización
+
+Sí, cada vez que:
+
+entrenás
+recalculás rutas
+cambia la data de incidentes
+
+No hace falta recalcular toda la historia siempre; solo las rutas nuevas o recientes.
+
+6. Tablas de resultados de modelos
+
+Muy útil separar predicción de entrenamiento.
+
+forecast_predictions
+forecast_predictions (
+    prediction_id bigserial primary key,
+    model_name text,
+    generated_at timestamp,
+    forecast_for timestamp,
+    police_district text,
+    incident_category text,
+    predicted_incidents double precision,
+    lower_bound double precision,
+    upper_bound double precision
+)
+Para qué
+mostrar resultados del forecasting
+Actualización
+
+Sí, cada vez que corra el modelo.
+
+risk_predictions
+risk_predictions (
+    prediction_id bigserial primary key,
+    model_name text,
+    generated_at timestamp,
+    target_timestamp timestamp,
+    police_district text,
+    incident_category text,
+    risk_score double precision,
+    risk_level text
+)
+Para qué
+clasificación de riesgo por zona/tiempo
+Actualización
+
+Sí, horaria o diaria.
+
+route_risk_predictions
+route_risk_predictions (
+    prediction_id bigserial primary key,
+    model_name text,
+    generated_at timestamp,
+    route_id bigint,
+    risk_score double precision,
+    risk_level text
+)
+Para qué
+resultados del modelo de riesgo sobre rutas
+Actualización
+
+Cada vez que evaluás una ruta.
+
+anomaly_detections
+anomaly_detections (
+    anomaly_id bigserial primary key,
+    model_name text,
+    generated_at timestamp,
+    bucket_start timestamp,
+    police_district text,
+    incident_category text,
+    expected_min double precision,
+    expected_max double precision,
+    observed_value double precision,
+    anomaly boolean,
+    severity text
+)
+Para qué
+detección de anomalías
+Actualización
+
+Sí, cada vez que corra el detector.
+
+7. Qué tablas necesita cada modelo
+A. Predicción de volumen
+
+Necesita:
+
+incidents_raw
+incident_counts_hourly
+opcional incident_counts_daily
+forecast_training_series
+forecast_predictions
+B. Clasificación de nivel de riesgo
+
+Necesita:
+
+incidents_raw
+incident_counts_hourly
+risk_features_hourly
+opcional spatial_grid_features
+risk_predictions
+C. Clustering de hotspots
+
+Necesita:
+
+incidents_raw
+incident_hotspots
+D. Modelo de riesgo sobre rutas
+
+Necesita:
+
+incidents_raw
+route_requests
+route_risk_features
+opcional spatial_grid_features
+route_risk_predictions
+E. Detección de anomalías
+
+Necesita:
+
+incidents_raw
+incident_counts_hourly
+incident_counts_daily
+anomaly_detections
+8. Cuáles requieren actualización constante
+Sí, actualización constante
+incidents_raw
+incident_counts_hourly
+incident_counts_daily
+risk_features_hourly
+forecast_training_series
+Actualización frecuente pero no urgente
+incident_hotspots
+spatial_grid_features
+Bajo demanda o por corrida de modelo
+forecast_predictions
+risk_predictions
+route_risk_features
+route_risk_predictions
+anomaly_detections
+9. MVP mínimo de verdad
+
+Si no querés sobreconstruir, arrancá con estas:
+
+incidents_raw
+incident_counts_hourly
+incident_counts_daily
+risk_features_hourly
+forecast_predictions
+risk_predictions
+
+Y si tenés coordenadas:
+
+incident_hotspots
+
+Y si integrás rutas:
+
+route_requests
+route_risk_features
+route_risk_predictions
+10. Mi recomendación realista
+
+Yo no crearía todo de una.
+Lo haría en este orden:
+
+Fase 1
+incidents_raw
+incident_counts_hourly
+incident_counts_daily
+Fase 2
+risk_features_hourly
+forecast_predictions
+risk_predictions
+Fase 3
+incident_hotspots
+spatial_grid_features
+Fase 4
+route_requests
+route_risk_features
+route_risk_predictions
+11. Respuesta corta a tu duda principal
+
+Sí, necesitan actualización constante, pero no en tiempo real absoluto.
+
+Un esquema razonable sería:
+
+ingesta API: cada 1 hora o cada 1 día
+agregados horarios: cada 1 hora
+hotspots/grid: cada 6 o 24 horas
+predicciones: cada 1 hora o cuando las necesites
+riesgo de rutas: on demand

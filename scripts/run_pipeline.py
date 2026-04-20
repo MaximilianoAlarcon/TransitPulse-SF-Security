@@ -38,6 +38,7 @@ SCRIPTS = [
     "scripts/refresh_daily_aggregates.py",
     "scripts/build_forecast_series.py",
     "scripts/build_risk_features.py",
+    "scripts/build_predictions.py"
 ]
 
 
