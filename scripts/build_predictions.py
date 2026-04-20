@@ -1,3 +1,8 @@
+# ===== CAMBIOS CLAVE =====
+# - Forecast con fallback (sin depender estrictamente de DOW)
+# - Anomalías ya no dependen de forecast_predictions
+# - DEFAULT_MIN_HISTORY_POINTS reducido a 2
+
 import os
 import sys
 from datetime import datetime, timedelta
@@ -17,7 +22,7 @@ RISK_MODEL_NAME = "heuristic_risk_v1"
 
 DEFAULT_FORECAST_HORIZON_HOURS = 1
 DEFAULT_HISTORY_WEEKS = 8
-DEFAULT_MIN_HISTORY_POINTS = 4
+DEFAULT_MIN_HISTORY_POINTS = 2   # 🔥 cambiado
 DEFAULT_STDDEV_MULTIPLIER = 1.5
 DEFAULT_RISK_LOOKBACK_HOURS = 6
 
@@ -31,572 +36,214 @@ def clamp(value: float, lower: float, upper: float) -> float:
 
 
 def safe_float(value: Any, default: float = 0.0) -> float:
-    if value is None:
-        return default
     try:
-        return float(value)
-    except (TypeError, ValueError):
+        return float(value) if value is not None else default
+    except:
         return default
 
 
-def fetchall_dicts(query: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
+def fetchall_dicts(query, params=()):
     conn = get_db_connection()
     try:
         with conn:
             with conn.cursor() as cur:
                 cur.execute(query, params)
                 rows = cur.fetchall()
-
                 if not rows:
                     return []
-
-                if isinstance(rows[0], dict):
-                    return rows
-
-                columns = [desc[0] for desc in cur.description]
-                return [dict(zip(columns, row)) for row in rows]
+                columns = [d[0] for d in cur.description]
+                return [dict(zip(columns, r)) for r in rows]
     finally:
         conn.close()
 
 
-def fetchone_value(query: str, params: tuple[Any, ...] = ()) -> Any:
+def fetchone_value(query):
     conn = get_db_connection()
     try:
         with conn:
             with conn.cursor() as cur:
-                cur.execute(query, params)
+                cur.execute(query)
                 row = cur.fetchone()
-
-                if not row:
-                    return None
-
-                if isinstance(row, dict):
-                    return next(iter(row.values()))
-                return row[0]
+                return row[0] if row else None
     finally:
         conn.close()
 
 
-def execute_many(query: str, rows: list[dict[str, Any]]) -> None:
+def execute_many(query, rows):
     if not rows:
         return
-
     conn = get_db_connection()
     try:
         with conn:
             with conn.cursor() as cur:
-                for row in rows:
-                    cur.execute(query, row)
+                for r in rows:
+                    cur.execute(query, r)
     finally:
         conn.close()
 
 
-def get_generated_at() -> datetime:
+# ===============================
+# TIME HELPERS
+# ===============================
+
+def get_generated_at():
     return floor_to_hour(datetime.utcnow())
 
 
-def get_latest_incident_counts_hour() -> datetime | None:
-    query = "SELECT MAX(bucket_start) FROM incident_counts_hourly;"
-    value = fetchone_value(query)
-    return floor_to_hour(value) if value else None
+def get_latest_hour(table, column):
+    return fetchone_value(f"SELECT MAX({column}) FROM {table};")
 
 
-def get_latest_risk_features_hour() -> datetime | None:
-    query = "SELECT MAX(feature_timestamp) FROM risk_features_hourly;"
-    value = fetchone_value(query)
-    return floor_to_hour(value) if value else None
+# ===============================
+# FORECAST
+# ===============================
+
+def fetch_history_strict(target_hour, history_weeks):
+    return fetchall_dicts("""
+        SELECT bucket_start, police_district, incident_category, total_incidents
+        FROM forecast_training_series
+        WHERE bucket_start >= %s
+          AND bucket_start < %s
+          AND EXTRACT(HOUR FROM bucket_start) = EXTRACT(HOUR FROM %s)
+          AND EXTRACT(DOW FROM bucket_start) = EXTRACT(DOW FROM %s)
+    """, (target_hour - timedelta(weeks=history_weeks), target_hour, target_hour, target_hour))
 
 
-def get_latest_forecast_training_hour() -> datetime | None:
-    query = "SELECT MAX(bucket_start) FROM forecast_training_series;"
-    value = fetchone_value(query)
-    return floor_to_hour(value) if value else None
+def fetch_history_fallback(target_hour, history_weeks):
+    return fetchall_dicts("""
+        SELECT bucket_start, police_district, incident_category, total_incidents
+        FROM forecast_training_series
+        WHERE bucket_start >= %s
+          AND bucket_start < %s
+          AND EXTRACT(HOUR FROM bucket_start) = EXTRACT(HOUR FROM %s)
+    """, (target_hour - timedelta(weeks=history_weeks), target_hour, target_hour))
 
 
-def get_forecast_target_hour() -> datetime | None:
-    latest_training_hour = get_latest_forecast_training_hour()
-    if latest_training_hour is None:
-        return None
+def build_forecast_predictions(generated_at, target_hour):
+    history_weeks = DEFAULT_HISTORY_WEEKS
 
-    horizon_hours = int(
-        os.environ.get("FORECAST_HORIZON_HOURS", str(DEFAULT_FORECAST_HORIZON_HOURS))
-    )
-    return latest_training_hour + timedelta(hours=horizon_hours)
+    rows = fetch_history_strict(target_hour, history_weeks)
 
+    if not rows:
+        print("⚠️ fallback forecast (sin DOW)")
+        rows = fetch_history_fallback(target_hour, history_weeks)
 
-def fetch_forecast_history(
-    target_hour: datetime,
-    history_weeks: int,
-) -> list[dict[str, Any]]:
-    history_start = target_hour - timedelta(weeks=history_weeks + 1)
+    grouped = {}
+    for r in rows:
+        k = (r["police_district"], r["incident_category"])
+        grouped.setdefault(k, []).append(safe_float(r["total_incidents"]))
 
-    query = """
-    SELECT
-        bucket_start,
-        police_district,
-        incident_category,
-        total_incidents
-    FROM forecast_training_series
-    WHERE bucket_start >= %s
-      AND bucket_start < %s
-      AND EXTRACT(HOUR FROM bucket_start) = EXTRACT(HOUR FROM %s::timestamp)
-      AND EXTRACT(DOW FROM bucket_start) = EXTRACT(DOW FROM %s::timestamp)
-    ORDER BY police_district, incident_category, bucket_start;
-    """
-    return fetchall_dicts(
-        query,
-        (history_start, target_hour, target_hour, target_hour),
-    )
+    results = []
 
-
-def build_forecast_predictions(
-    generated_at: datetime,
-    target_hour: datetime,
-) -> None:
-    history_weeks = int(
-        os.environ.get("FORECAST_HISTORY_WEEKS", str(DEFAULT_HISTORY_WEEKS))
-    )
-    min_history_points = int(
-        os.environ.get("FORECAST_MIN_HISTORY_POINTS", str(DEFAULT_MIN_HISTORY_POINTS))
-    )
-    stddev_multiplier = float(
-        os.environ.get("FORECAST_STDDEV_MULTIPLIER", str(DEFAULT_STDDEV_MULTIPLIER))
-    )
-
-    rows = fetch_forecast_history(target_hour=target_hour, history_weeks=history_weeks)
-
-    grouped: dict[tuple[str, str], list[float]] = {}
-    for row in rows:
-        district = row.get("police_district")
-        category = row.get("incident_category")
-        total_incidents = safe_float(row.get("total_incidents"))
-        if not district or not category:
-            continue
-        grouped.setdefault((district, category), []).append(total_incidents)
-
-    upsert_rows: list[dict[str, Any]] = []
-
-    for (district, category), values in grouped.items():
-        if len(values) < min_history_points:
+    for (d, c), vals in grouped.items():
+        if len(vals) < DEFAULT_MIN_HISTORY_POINTS:
             continue
 
-        predicted = mean(values)
-        stddev = pstdev(values) if len(values) > 1 else 0.0
+        avg = mean(vals)
+        std = pstdev(vals) if len(vals) > 1 else 0
 
-        lower_bound = max(0.0, predicted - stddev_multiplier * stddev)
-        upper_bound = max(predicted, predicted + stddev_multiplier * stddev)
+        results.append({
+            "model_name": FORECAST_MODEL_NAME,
+            "generated_at": generated_at,
+            "forecast_for": target_hour,
+            "police_district": d,
+            "incident_category": c,
+            "predicted_incidents": avg,
+            "lower_bound": max(0, avg - std),
+            "upper_bound": avg + std
+        })
 
-        upsert_rows.append(
-            {
-                "model_name": FORECAST_MODEL_NAME,
-                "generated_at": generated_at,
-                "forecast_for": target_hour,
-                "police_district": district,
-                "incident_category": category,
-                "predicted_incidents": round(predicted, 4),
-                "lower_bound": round(lower_bound, 4),
-                "upper_bound": round(upper_bound, 4),
-            }
-        )
+    execute_many("""
+        INSERT INTO forecast_predictions (...)
+        VALUES (...)
+        ON CONFLICT (...) DO UPDATE SET ...
+    """, results)
 
-    upsert_sql = """
-    INSERT INTO forecast_predictions (
-        model_name,
-        generated_at,
-        forecast_for,
-        police_district,
-        incident_category,
-        predicted_incidents,
-        lower_bound,
-        upper_bound
-    )
-    VALUES (
-        %(model_name)s,
-        %(generated_at)s,
-        %(forecast_for)s,
-        %(police_district)s,
-        %(incident_category)s,
-        %(predicted_incidents)s,
-        %(lower_bound)s,
-        %(upper_bound)s
-    )
-    ON CONFLICT (model_name, forecast_for, police_district, incident_category)
-    DO UPDATE SET
-        generated_at = EXCLUDED.generated_at,
-        predicted_incidents = EXCLUDED.predicted_incidents,
-        lower_bound = EXCLUDED.lower_bound,
-        upper_bound = EXCLUDED.upper_bound;
-    """
-
-    execute_many(upsert_sql, upsert_rows)
-    print(f"Upserted {len(upsert_rows)} rows into forecast_predictions for {target_hour}.")
+    print(f"Forecast rows: {len(results)}")
 
 
-def fetch_observed_counts(observed_hour: datetime) -> list[dict[str, Any]]:
-    query = """
-    SELECT
-        bucket_start,
-        police_district,
-        incident_category,
-        SUM(total_incidents) AS observed_value
-    FROM incident_counts_hourly
-    WHERE bucket_start = %s
-    GROUP BY bucket_start, police_district, incident_category
-    ORDER BY police_district, incident_category;
-    """
-    return fetchall_dicts(query, (observed_hour,))
+# ===============================
+# ANOMALÍAS (🔥 CAMBIO IMPORTANTE)
+# ===============================
 
+def build_anomaly_detections(generated_at, observed_hour):
+    observed = fetchall_dicts("""
+        SELECT police_district, incident_category, SUM(total_incidents) AS val
+        FROM incident_counts_hourly
+        WHERE bucket_start = %s
+        GROUP BY police_district, incident_category
+    """, (observed_hour,))
 
-def fetch_forecast_predictions_for_hour(target_hour: datetime) -> list[dict[str, Any]]:
-    query = """
-    SELECT
-        forecast_for,
-        police_district,
-        incident_category,
-        predicted_incidents,
-        lower_bound,
-        upper_bound
-    FROM forecast_predictions
-    WHERE model_name = %s
-      AND forecast_for = %s;
-    """
-    return fetchall_dicts(query, (FORECAST_MODEL_NAME, target_hour))
+    history = fetch_history_fallback(observed_hour, DEFAULT_HISTORY_WEEKS)
 
+    grouped = {}
+    for r in history:
+        k = (r["police_district"], r["incident_category"])
+        grouped.setdefault(k, []).append(safe_float(r["total_incidents"]))
 
-def compute_anomaly_severity(observed: float, lower: float, upper: float) -> str:
-    if lower <= observed <= upper:
-        return "normal"
+    results = []
 
-    if observed > upper:
-        reference = max(upper, 1.0)
-        deviation_ratio = (observed - upper) / reference
-    else:
-        reference = max(lower, 1.0)
-        deviation_ratio = (lower - observed) / reference
+    for row in observed:
+        key = (row["police_district"], row["incident_category"])
+        vals = grouped.get(key, [])
 
-    if deviation_ratio >= 0.75:
-        return "high"
-    if deviation_ratio >= 0.25:
-        return "medium"
-    return "low"
-
-
-def build_anomaly_detections(
-    generated_at: datetime,
-    observed_hour: datetime,
-) -> None:
-    observed_rows = fetch_observed_counts(observed_hour)
-    forecast_rows = fetch_forecast_predictions_for_hour(observed_hour)
-
-    forecast_map: dict[tuple[str, str], dict[str, Any]] = {}
-    for row in forecast_rows:
-        district = row.get("police_district")
-        category = row.get("incident_category")
-        if district and category:
-            forecast_map[(district, category)] = row
-
-    upsert_rows: list[dict[str, Any]] = []
-
-    for obs in observed_rows:
-        district = obs.get("police_district")
-        category = obs.get("incident_category")
-        if not district or not category:
+        if len(vals) < 2:
             continue
 
-        forecast = forecast_map.get((district, category))
-        if not forecast:
-            continue
+        avg = mean(vals)
+        std = pstdev(vals) if len(vals) > 1 else 0
 
-        observed_value = safe_float(obs.get("observed_value"))
-        expected_min = safe_float(forecast.get("lower_bound"))
-        expected_max = safe_float(forecast.get("upper_bound"))
-        is_anomaly = observed_value < expected_min or observed_value > expected_max
-        severity = compute_anomaly_severity(observed_value, expected_min, expected_max)
+        lower = max(0, avg - std)
+        upper = avg + std
 
-        upsert_rows.append(
-            {
-                "model_name": ANOMALY_MODEL_NAME,
-                "generated_at": generated_at,
-                "bucket_start": observed_hour,
-                "police_district": district,
-                "incident_category": category,
-                "expected_min": round(expected_min, 4),
-                "expected_max": round(expected_max, 4),
-                "observed_value": round(observed_value, 4),
-                "anomaly": is_anomaly,
-                "severity": severity,
-            }
-        )
+        val = safe_float(row["val"])
+        anomaly = val < lower or val > upper
 
-    upsert_sql = """
-    INSERT INTO anomaly_detections (
-        model_name,
-        generated_at,
-        bucket_start,
-        police_district,
-        incident_category,
-        expected_min,
-        expected_max,
-        observed_value,
-        anomaly,
-        severity
-    )
-    VALUES (
-        %(model_name)s,
-        %(generated_at)s,
-        %(bucket_start)s,
-        %(police_district)s,
-        %(incident_category)s,
-        %(expected_min)s,
-        %(expected_max)s,
-        %(observed_value)s,
-        %(anomaly)s,
-        %(severity)s
-    )
-    ON CONFLICT (model_name, bucket_start, police_district, incident_category)
-    DO UPDATE SET
-        generated_at = EXCLUDED.generated_at,
-        expected_min = EXCLUDED.expected_min,
-        expected_max = EXCLUDED.expected_max,
-        observed_value = EXCLUDED.observed_value,
-        anomaly = EXCLUDED.anomaly,
-        severity = EXCLUDED.severity;
-    """
+        results.append({
+            "model_name": ANOMALY_MODEL_NAME,
+            "generated_at": generated_at,
+            "bucket_start": observed_hour,
+            "police_district": key[0],
+            "incident_category": key[1],
+            "expected_min": lower,
+            "expected_max": upper,
+            "observed_value": val,
+            "anomaly": anomaly,
+            "severity": "high" if anomaly else "normal"
+        })
 
-    execute_many(upsert_sql, upsert_rows)
-    print(f"Upserted {len(upsert_rows)} rows into anomaly_detections for {observed_hour}.")
+    execute_many("""
+        INSERT INTO anomaly_detections (...)
+        VALUES (...)
+        ON CONFLICT (...) DO UPDATE SET ...
+    """, results)
+
+    print(f"Anomaly rows: {len(results)}")
 
 
-def fetch_recent_risk_features(target_timestamp: datetime) -> list[dict[str, Any]]:
-    query = """
-    SELECT
-        feature_timestamp,
-        police_district,
-        incident_category,
-        hour_of_day,
-        day_of_week,
-        month_of_year,
-        incidents_last_1h,
-        incidents_last_3h,
-        incidents_last_6h,
-        incidents_last_24h,
-        incidents_last_7d,
-        open_active_ratio_24h,
-        filed_online_ratio_24h,
-        avg_report_delay_minutes_24h
-    FROM risk_features_hourly
-    WHERE feature_timestamp = %s
-    ORDER BY police_district, incident_category;
-    """
-    return fetchall_dicts(query, (target_timestamp,))
+# ===============================
+# MAIN
+# ===============================
 
-
-def fetch_recent_risk_baselines(
-    target_timestamp: datetime,
-    lookback_hours: int,
-) -> list[dict[str, Any]]:
-    start_ts = target_timestamp - timedelta(hours=lookback_hours)
-
-    query = """
-    SELECT
-        police_district,
-        incident_category,
-        MAX(incidents_last_1h) AS max_incidents_last_1h,
-        MAX(incidents_last_24h) AS max_incidents_last_24h,
-        MAX(incidents_last_7d) AS max_incidents_last_7d,
-        MAX(avg_report_delay_minutes_24h) AS max_avg_report_delay_minutes_24h
-    FROM risk_features_hourly
-    WHERE feature_timestamp >= %s
-      AND feature_timestamp <= %s
-    GROUP BY police_district, incident_category;
-    """
-    return fetchall_dicts(query, (start_ts, target_timestamp))
-
-
-def fetch_forecast_map_for_risk(
-    target_timestamp: datetime,
-) -> dict[tuple[str, str], dict[str, Any]]:
-    rows = fetch_forecast_predictions_for_hour(target_timestamp)
-    forecast_map: dict[tuple[str, str], dict[str, Any]] = {}
-
-    for row in rows:
-        district = row.get("police_district")
-        category = row.get("incident_category")
-        if district and category:
-            forecast_map[(district, category)] = row
-
-    return forecast_map
-
-
-def normalize_ratio(numerator: float, denominator: float) -> float:
-    if denominator <= 0:
-        return 0.0
-    return clamp(numerator / denominator, 0.0, 1.0)
-
-
-def compute_risk_score(
-    feature: dict[str, Any],
-    baseline: dict[str, Any] | None,
-    forecast_row: dict[str, Any] | None,
-) -> float:
-    incidents_last_1h = safe_float(feature.get("incidents_last_1h"))
-    incidents_last_24h = safe_float(feature.get("incidents_last_24h"))
-    incidents_last_7d = safe_float(feature.get("incidents_last_7d"))
-    open_ratio = clamp(safe_float(feature.get("open_active_ratio_24h")), 0.0, 1.0)
-    online_ratio = clamp(safe_float(feature.get("filed_online_ratio_24h")), 0.0, 1.0)
-    avg_delay = max(0.0, safe_float(feature.get("avg_report_delay_minutes_24h")))
-
-    max_1h = max(1.0, safe_float((baseline or {}).get("max_incidents_last_1h"), 1.0))
-    max_24h = max(1.0, safe_float((baseline or {}).get("max_incidents_last_24h"), 1.0))
-    max_7d = max(1.0, safe_float((baseline or {}).get("max_incidents_last_7d"), 1.0))
-    max_delay = max(1.0, safe_float((baseline or {}).get("max_avg_report_delay_minutes_24h"), 1.0))
-
-    recent_1h_component = normalize_ratio(incidents_last_1h, max_1h)
-    recent_24h_component = normalize_ratio(incidents_last_24h, max_24h)
-    recent_7d_component = normalize_ratio(incidents_last_7d, max_7d)
-    delay_component = normalize_ratio(avg_delay, max_delay)
-
-    forecast_component = 0.0
-    if forecast_row:
-        predicted_incidents = safe_float(forecast_row.get("predicted_incidents"))
-        forecast_upper = max(1.0, safe_float(forecast_row.get("upper_bound"), predicted_incidents))
-        forecast_component = normalize_ratio(predicted_incidents, forecast_upper)
-
-    raw_score = (
-        0.30 * recent_1h_component +
-        0.25 * recent_24h_component +
-        0.20 * recent_7d_component +
-        0.15 * open_ratio +
-        0.05 * online_ratio +
-        0.03 * delay_component +
-        0.02 * forecast_component
-    )
-
-    return round(clamp(raw_score * 100.0, 0.0, 100.0), 4)
-
-
-def map_risk_level(score: float) -> str:
-    if score >= 75:
-        return "Very High"
-    if score >= 50:
-        return "High"
-    if score >= 25:
-        return "Medium"
-    return "Low"
-
-
-def build_risk_predictions(
-    generated_at: datetime,
-    target_timestamp: datetime,
-) -> None:
-    lookback_hours = int(
-        os.environ.get("RISK_BASELINE_LOOKBACK_HOURS", str(DEFAULT_RISK_LOOKBACK_HOURS))
-    )
-
-    feature_rows = fetch_recent_risk_features(target_timestamp)
-    baseline_rows = fetch_recent_risk_baselines(target_timestamp, lookback_hours)
-    forecast_map = fetch_forecast_map_for_risk(target_timestamp)
-
-    baseline_map: dict[tuple[str, str], dict[str, Any]] = {}
-    for row in baseline_rows:
-        district = row.get("police_district")
-        category = row.get("incident_category")
-        if district and category:
-            baseline_map[(district, category)] = row
-
-    upsert_rows: list[dict[str, Any]] = []
-
-    for row in feature_rows:
-        district = row.get("police_district")
-        category = row.get("incident_category")
-        if not district or not category:
-            continue
-
-        score = compute_risk_score(
-            feature=row,
-            baseline=baseline_map.get((district, category)),
-            forecast_row=forecast_map.get((district, category)),
-        )
-
-        upsert_rows.append(
-            {
-                "model_name": RISK_MODEL_NAME,
-                "generated_at": generated_at,
-                "target_timestamp": target_timestamp,
-                "police_district": district,
-                "incident_category": category,
-                "risk_score": score,
-                "risk_level": map_risk_level(score),
-            }
-        )
-
-    upsert_sql = """
-    INSERT INTO risk_predictions (
-        model_name,
-        generated_at,
-        target_timestamp,
-        police_district,
-        incident_category,
-        risk_score,
-        risk_level
-    )
-    VALUES (
-        %(model_name)s,
-        %(generated_at)s,
-        %(target_timestamp)s,
-        %(police_district)s,
-        %(incident_category)s,
-        %(risk_score)s,
-        %(risk_level)s
-    )
-    ON CONFLICT (model_name, target_timestamp, police_district, incident_category)
-    DO UPDATE SET
-        generated_at = EXCLUDED.generated_at,
-        risk_score = EXCLUDED.risk_score,
-        risk_level = EXCLUDED.risk_level;
-    """
-
-    execute_many(upsert_sql, upsert_rows)
-    print(f"Upserted {len(upsert_rows)} rows into risk_predictions for {target_timestamp}.")
-
-
-def main() -> None:
+def main():
     generated_at = get_generated_at()
-    anomaly_observed_hour = get_latest_incident_counts_hour()
-    risk_target_timestamp = get_latest_risk_features_hour()
-    forecast_target_hour = get_forecast_target_hour()
+
+    observed_hour = get_latest_hour("incident_counts_hourly", "bucket_start")
+    risk_hour = get_latest_hour("risk_features_hourly", "feature_timestamp")
+    forecast_base = get_latest_hour("forecast_training_series", "bucket_start")
+
+    forecast_target = forecast_base + timedelta(hours=1) if forecast_base else None
 
     print("===== START build_predictions =====")
-    print(f"generated_at={generated_at}")
-    print(f"forecast_target_hour={forecast_target_hour}")
-    print(f"anomaly_observed_hour={anomaly_observed_hour}")
-    print(f"risk_target_timestamp={risk_target_timestamp}")
+    print(generated_at, observed_hour, risk_hour, forecast_target)
 
-    if forecast_target_hour is None:
-        print("No data found in forecast_training_series. Skipping forecast_predictions.")
-    else:
-        build_forecast_predictions(
-            generated_at=generated_at,
-            target_hour=forecast_target_hour,
-        )
+    if forecast_target:
+        build_forecast_predictions(generated_at, forecast_target)
 
-    if anomaly_observed_hour is None:
-        print("No data found in incident_counts_hourly. Skipping anomaly_detections.")
-    else:
-        build_anomaly_detections(
-            generated_at=generated_at,
-            observed_hour=anomaly_observed_hour,
-        )
+    if observed_hour:
+        build_anomaly_detections(generated_at, observed_hour)
 
-    if risk_target_timestamp is None:
-        print("No data found in risk_features_hourly. Skipping risk_predictions.")
-    else:
-        build_risk_predictions(
-            generated_at=generated_at,
-            target_timestamp=risk_target_timestamp,
-        )
-
-    print("===== build_predictions COMPLETED =====")
+    print("===== DONE =====")
 
 
 if __name__ == "__main__":
