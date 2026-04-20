@@ -16,7 +16,7 @@ ANOMALY_MODEL_NAME = "range_detector_v1"
 RISK_MODEL_NAME = "heuristic_risk_v1"
 
 DEFAULT_FORECAST_HORIZON_HOURS = 1
-DEFAULT_HISTORY_WEEKS = 8
+DEFAULT_HISTORY_WEEKS = 12
 DEFAULT_MIN_HISTORY_POINTS = 2
 DEFAULT_STDDEV_MULTIPLIER = 1.0
 DEFAULT_RISK_LOOKBACK_HOURS = 6
@@ -160,10 +160,8 @@ def build_forecast_predictions(generated_at: datetime, target_hour: datetime) ->
 
     for key in all_keys:
         values = strict_grouped.get(key, [])
-        history_mode = "strict"
         if len(values) < min_history_points:
             values = fallback_grouped.get(key, [])
-            history_mode = "fallback_hour_only"
 
         if len(values) < min_history_points:
             continue
@@ -239,6 +237,52 @@ def compute_anomaly_severity(observed: float, lower: float, upper: float) -> str
     return "low"
 
 
+def build_groupings(rows: list[dict[str, Any]]) -> dict[str, dict[Any, list[float]]]:
+    groupings = {
+        "district_category": {},
+        "category": {},
+        "global": {},
+    }
+
+    for row in rows:
+        district = row.get("police_district")
+        category = row.get("incident_category")
+        total_incidents = safe_float(row.get("total_incidents"))
+
+        if district and category:
+            groupings["district_category"].setdefault((district, category), []).append(total_incidents)
+
+        if category:
+            groupings["category"].setdefault(category, []).append(total_incidents)
+
+        groupings["global"].setdefault("all", []).append(total_incidents)
+
+    return groupings
+
+
+def select_anomaly_history(
+    district: str,
+    category: str,
+    strict_groupings: dict[str, dict[Any, list[float]]],
+    fallback_groupings: dict[str, dict[Any, list[float]]],
+    min_history_points: int,
+) -> tuple[list[float], str]:
+    candidates = [
+        ("district_category_strict", strict_groupings["district_category"].get((district, category), [])),
+        ("district_category_fallback", fallback_groupings["district_category"].get((district, category), [])),
+        ("category_strict", strict_groupings["category"].get(category, [])),
+        ("category_fallback", fallback_groupings["category"].get(category, [])),
+        ("global_strict", strict_groupings["global"].get("all", [])),
+        ("global_fallback", fallback_groupings["global"].get("all", [])),
+    ]
+
+    for mode, values in candidates:
+        if len(values) >= min_history_points:
+            return values, mode
+
+    return [], "insufficient_history"
+
+
 def build_anomaly_detections(generated_at: datetime, observed_hour: datetime) -> None:
     observed = fetchall_dicts(
         """
@@ -258,22 +302,8 @@ def build_anomaly_detections(generated_at: datetime, observed_hour: datetime) ->
     strict_rows = fetch_history_strict(observed_hour, history_weeks)
     fallback_rows = fetch_history_fallback(observed_hour, history_weeks)
 
-    strict_grouped: dict[tuple[str, str], list[float]] = {}
-    fallback_grouped: dict[tuple[str, str], list[float]] = {}
-
-    for row in strict_rows:
-        district = row.get("police_district")
-        category = row.get("incident_category")
-        if not district or not category:
-            continue
-        strict_grouped.setdefault((district, category), []).append(safe_float(row.get("total_incidents")))
-
-    for row in fallback_rows:
-        district = row.get("police_district")
-        category = row.get("incident_category")
-        if not district or not category:
-            continue
-        fallback_grouped.setdefault((district, category), []).append(safe_float(row.get("total_incidents")))
+    strict_groupings = build_groupings(strict_rows)
+    fallback_groupings = build_groupings(fallback_rows)
 
     results: list[dict[str, Any]] = []
 
@@ -283,10 +313,13 @@ def build_anomaly_detections(generated_at: datetime, observed_hour: datetime) ->
         if not district or not category:
             continue
 
-        key = (district, category)
-        values = strict_grouped.get(key, [])
-        if len(values) < min_history_points:
-            values = fallback_grouped.get(key, [])
+        values, history_mode = select_anomaly_history(
+            district=district,
+            category=category,
+            strict_groupings=strict_groupings,
+            fallback_groupings=fallback_groupings,
+            min_history_points=min_history_points,
+        )
 
         if len(values) < min_history_points:
             continue
