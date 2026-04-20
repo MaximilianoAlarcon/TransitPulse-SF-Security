@@ -59,6 +59,24 @@ def fetchall_dicts(query: str, params: tuple[Any, ...] = ()) -> list[dict[str, A
         conn.close()
 
 
+def fetchone_value(query: str, params: tuple[Any, ...] = ()) -> Any:
+    conn = get_db_connection()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(query, params)
+                row = cur.fetchone()
+
+                if not row:
+                    return None
+
+                if isinstance(row, dict):
+                    return next(iter(row.values()))
+                return row[0]
+    finally:
+        conn.close()
+
+
 def execute_many(query: str, rows: list[dict[str, Any]]) -> None:
     if not rows:
         return
@@ -77,19 +95,33 @@ def get_generated_at() -> datetime:
     return floor_to_hour(datetime.utcnow())
 
 
-def get_forecast_target_hour(generated_at: datetime) -> datetime:
+def get_latest_incident_counts_hour() -> datetime | None:
+    query = "SELECT MAX(bucket_start) FROM incident_counts_hourly;"
+    value = fetchone_value(query)
+    return floor_to_hour(value) if value else None
+
+
+def get_latest_risk_features_hour() -> datetime | None:
+    query = "SELECT MAX(feature_timestamp) FROM risk_features_hourly;"
+    value = fetchone_value(query)
+    return floor_to_hour(value) if value else None
+
+
+def get_latest_forecast_training_hour() -> datetime | None:
+    query = "SELECT MAX(bucket_start) FROM forecast_training_series;"
+    value = fetchone_value(query)
+    return floor_to_hour(value) if value else None
+
+
+def get_forecast_target_hour() -> datetime | None:
+    latest_training_hour = get_latest_forecast_training_hour()
+    if latest_training_hour is None:
+        return None
+
     horizon_hours = int(
         os.environ.get("FORECAST_HORIZON_HOURS", str(DEFAULT_FORECAST_HORIZON_HOURS))
     )
-    return generated_at + timedelta(hours=horizon_hours)
-
-
-def get_anomaly_observed_hour(generated_at: datetime) -> datetime:
-    return generated_at
-
-
-def get_risk_target_timestamp(generated_at: datetime) -> datetime:
-    return generated_at
+    return latest_training_hour + timedelta(hours=horizon_hours)
 
 
 def fetch_forecast_history(
@@ -140,8 +172,7 @@ def build_forecast_predictions(
         total_incidents = safe_float(row.get("total_incidents"))
         if not district or not category:
             continue
-        key = (district, category)
-        grouped.setdefault(key, []).append(total_incidents)
+        grouped.setdefault((district, category), []).append(total_incidents)
 
     upsert_rows: list[dict[str, Any]] = []
 
@@ -198,9 +229,7 @@ def build_forecast_predictions(
     """
 
     execute_many(upsert_sql, upsert_rows)
-    print(
-        f"Upserted {len(upsert_rows)} rows into forecast_predictions for {target_hour}."
-    )
+    print(f"Upserted {len(upsert_rows)} rows into forecast_predictions for {target_hour}.")
 
 
 def fetch_observed_counts(observed_hour: datetime) -> list[dict[str, Any]]:
@@ -263,9 +292,8 @@ def build_anomaly_detections(
     for row in forecast_rows:
         district = row.get("police_district")
         category = row.get("incident_category")
-        if not district or not category:
-            continue
-        forecast_map[(district, category)] = row
+        if district and category:
+            forecast_map[(district, category)] = row
 
     upsert_rows: list[dict[str, Any]] = []
 
@@ -275,11 +303,11 @@ def build_anomaly_detections(
         if not district or not category:
             continue
 
-        observed_value = safe_float(obs.get("observed_value"))
         forecast = forecast_map.get((district, category))
         if not forecast:
             continue
 
+        observed_value = safe_float(obs.get("observed_value"))
         expected_min = safe_float(forecast.get("lower_bound"))
         expected_max = safe_float(forecast.get("upper_bound"))
         is_anomaly = observed_value < expected_min or observed_value > expected_max
@@ -336,9 +364,7 @@ def build_anomaly_detections(
     """
 
     execute_many(upsert_sql, upsert_rows)
-    print(
-        f"Upserted {len(upsert_rows)} rows into anomaly_detections for {observed_hour}."
-    )
+    print(f"Upserted {len(upsert_rows)} rows into anomaly_detections for {observed_hour}.")
 
 
 def fetch_recent_risk_features(target_timestamp: datetime) -> list[dict[str, Any]]:
@@ -391,16 +417,15 @@ def fetch_forecast_map_for_risk(
     target_timestamp: datetime,
 ) -> dict[tuple[str, str], dict[str, Any]]:
     rows = fetch_forecast_predictions_for_hour(target_timestamp)
-    output: dict[tuple[str, str], dict[str, Any]] = {}
+    forecast_map: dict[tuple[str, str], dict[str, Any]] = {}
 
     for row in rows:
         district = row.get("police_district")
         category = row.get("incident_category")
-        if not district or not category:
-            continue
-        output[(district, category)] = row
+        if district and category:
+            forecast_map[(district, category)] = row
 
-    return output
+    return forecast_map
 
 
 def normalize_ratio(numerator: float, denominator: float) -> float:
@@ -424,10 +449,7 @@ def compute_risk_score(
     max_1h = max(1.0, safe_float((baseline or {}).get("max_incidents_last_1h"), 1.0))
     max_24h = max(1.0, safe_float((baseline or {}).get("max_incidents_last_24h"), 1.0))
     max_7d = max(1.0, safe_float((baseline or {}).get("max_incidents_last_7d"), 1.0))
-    max_delay = max(
-        1.0,
-        safe_float((baseline or {}).get("max_avg_report_delay_minutes_24h"), 1.0),
-    )
+    max_delay = max(1.0, safe_float((baseline or {}).get("max_avg_report_delay_minutes_24h"), 1.0))
 
     recent_1h_component = normalize_ratio(incidents_last_1h, max_1h)
     recent_24h_component = normalize_ratio(incidents_last_24h, max_24h)
@@ -437,20 +459,17 @@ def compute_risk_score(
     forecast_component = 0.0
     if forecast_row:
         predicted_incidents = safe_float(forecast_row.get("predicted_incidents"))
-        forecast_upper = max(
-            1.0,
-            safe_float(forecast_row.get("upper_bound"), predicted_incidents),
-        )
+        forecast_upper = max(1.0, safe_float(forecast_row.get("upper_bound"), predicted_incidents))
         forecast_component = normalize_ratio(predicted_incidents, forecast_upper)
 
     raw_score = (
-        0.30 * recent_1h_component
-        + 0.25 * recent_24h_component
-        + 0.20 * recent_7d_component
-        + 0.15 * open_ratio
-        + 0.05 * online_ratio
-        + 0.03 * delay_component
-        + 0.02 * forecast_component
+        0.30 * recent_1h_component +
+        0.25 * recent_24h_component +
+        0.20 * recent_7d_component +
+        0.15 * open_ratio +
+        0.05 * online_ratio +
+        0.03 * delay_component +
+        0.02 * forecast_component
     )
 
     return round(clamp(raw_score * 100.0, 0.0, 100.0), 4)
@@ -482,9 +501,8 @@ def build_risk_predictions(
     for row in baseline_rows:
         district = row.get("police_district")
         category = row.get("incident_category")
-        if not district or not category:
-            continue
-        baseline_map[(district, category)] = row
+        if district and category:
+            baseline_map[(district, category)] = row
 
     upsert_rows: list[dict[str, Any]] = []
 
@@ -494,11 +512,10 @@ def build_risk_predictions(
         if not district or not category:
             continue
 
-        key = (district, category)
         score = compute_risk_score(
             feature=row,
-            baseline=baseline_map.get(key),
-            forecast_row=forecast_map.get(key),
+            baseline=baseline_map.get((district, category)),
+            forecast_row=forecast_map.get((district, category)),
         )
 
         upsert_rows.append(
@@ -545,9 +562,9 @@ def build_risk_predictions(
 
 def main() -> None:
     generated_at = get_generated_at()
-    forecast_target_hour = get_forecast_target_hour(generated_at)
-    anomaly_observed_hour = get_anomaly_observed_hour(generated_at)
-    risk_target_timestamp = get_risk_target_timestamp(generated_at)
+    anomaly_observed_hour = get_latest_incident_counts_hour()
+    risk_target_timestamp = get_latest_risk_features_hour()
+    forecast_target_hour = get_forecast_target_hour()
 
     print("===== START build_predictions =====")
     print(f"generated_at={generated_at}")
@@ -555,20 +572,29 @@ def main() -> None:
     print(f"anomaly_observed_hour={anomaly_observed_hour}")
     print(f"risk_target_timestamp={risk_target_timestamp}")
 
-    build_forecast_predictions(
-        generated_at=generated_at,
-        target_hour=forecast_target_hour,
-    )
+    if forecast_target_hour is None:
+        print("No data found in forecast_training_series. Skipping forecast_predictions.")
+    else:
+        build_forecast_predictions(
+            generated_at=generated_at,
+            target_hour=forecast_target_hour,
+        )
 
-    build_anomaly_detections(
-        generated_at=generated_at,
-        observed_hour=anomaly_observed_hour,
-    )
+    if anomaly_observed_hour is None:
+        print("No data found in incident_counts_hourly. Skipping anomaly_detections.")
+    else:
+        build_anomaly_detections(
+            generated_at=generated_at,
+            observed_hour=anomaly_observed_hour,
+        )
 
-    build_risk_predictions(
-        generated_at=generated_at,
-        target_timestamp=risk_target_timestamp,
-    )
+    if risk_target_timestamp is None:
+        print("No data found in risk_features_hourly. Skipping risk_predictions.")
+    else:
+        build_risk_predictions(
+            generated_at=generated_at,
+            target_timestamp=risk_target_timestamp,
+        )
 
     print("===== build_predictions COMPLETED =====")
 
