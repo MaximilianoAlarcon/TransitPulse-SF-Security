@@ -13,13 +13,30 @@ from utils import get_db_connection
 
 FORECAST_MODEL_NAME = "baseline_seasonal_v1"
 ANOMALY_MODEL_NAME = "range_detector_v1"
-RISK_MODEL_NAME = "heuristic_risk_v1"
+
+# Nueva version del modelo de riesgo.
+# Mantener v2 permite comparar resultados contra heuristic_risk_v1 sin pisarlos.
+RISK_MODEL_NAME = os.environ.get("RISK_MODEL_NAME", "heuristic_risk_v2")
 
 DEFAULT_FORECAST_HORIZON_HOURS = 1
 DEFAULT_HISTORY_WEEKS = 12
 DEFAULT_MIN_HISTORY_POINTS = 2
 DEFAULT_STDDEV_MULTIPLIER = 1.0
-DEFAULT_RISK_LOOKBACK_HOURS = 6
+
+# Riesgo: usar mas historia que la version anterior.
+DEFAULT_RISK_HISTORY_WEEKS = 12
+DEFAULT_RISK_MIN_HISTORY_POINTS = 4
+DEFAULT_RISK_STDDEV_FLOOR = 1.0
+DEFAULT_RISK_Z_CAP = 3.0
+
+RISK_FEATURE_COLUMNS = [
+    "incidents_last_1h",
+    "incidents_last_3h",
+    "incidents_last_6h",
+    "incidents_last_24h",
+    "incidents_last_7d",
+    "avg_report_delay_minutes_24h",
+]
 
 
 def floor_to_hour(dt: datetime) -> datetime:
@@ -410,23 +427,52 @@ def fetch_recent_risk_features(target_timestamp: datetime) -> list[dict[str, Any
     )
 
 
-def fetch_recent_risk_baselines(target_timestamp: datetime, lookback_hours: int) -> list[dict[str, Any]]:
-    start_ts = target_timestamp - timedelta(hours=lookback_hours)
+def fetch_risk_history_strict(target_timestamp: datetime, history_weeks: int) -> list[dict[str, Any]]:
+    history_start = target_timestamp - timedelta(weeks=history_weeks)
     return fetchall_dicts(
         """
         SELECT
+            feature_timestamp,
             police_district,
             incident_category,
-            MAX(incidents_last_1h) AS max_incidents_last_1h,
-            MAX(incidents_last_24h) AS max_incidents_last_24h,
-            MAX(incidents_last_7d) AS max_incidents_last_7d,
-            MAX(avg_report_delay_minutes_24h) AS max_avg_report_delay_minutes_24h
+            incidents_last_1h,
+            incidents_last_3h,
+            incidents_last_6h,
+            incidents_last_24h,
+            incidents_last_7d,
+            avg_report_delay_minutes_24h
         FROM risk_features_hourly
         WHERE feature_timestamp >= %s
-          AND feature_timestamp <= %s
-        GROUP BY police_district, incident_category;
+          AND feature_timestamp < %s
+          AND EXTRACT(HOUR FROM feature_timestamp) = EXTRACT(HOUR FROM %s::timestamp)
+          AND EXTRACT(DOW FROM feature_timestamp) = EXTRACT(DOW FROM %s::timestamp)
+        ORDER BY feature_timestamp;
         """,
-        (start_ts, target_timestamp),
+        (history_start, target_timestamp, target_timestamp, target_timestamp),
+    )
+
+
+def fetch_risk_history_fallback(target_timestamp: datetime, history_weeks: int) -> list[dict[str, Any]]:
+    history_start = target_timestamp - timedelta(weeks=history_weeks)
+    return fetchall_dicts(
+        """
+        SELECT
+            feature_timestamp,
+            police_district,
+            incident_category,
+            incidents_last_1h,
+            incidents_last_3h,
+            incidents_last_6h,
+            incidents_last_24h,
+            incidents_last_7d,
+            avg_report_delay_minutes_24h
+        FROM risk_features_hourly
+        WHERE feature_timestamp >= %s
+          AND feature_timestamp < %s
+          AND EXTRACT(HOUR FROM feature_timestamp) = EXTRACT(HOUR FROM %s::timestamp)
+        ORDER BY feature_timestamp;
+        """,
+        (history_start, target_timestamp, target_timestamp),
     )
 
 
@@ -456,74 +502,237 @@ def fetch_forecast_map_for_risk(target_timestamp: datetime) -> dict[tuple[str, s
     return output
 
 
-def normalize_ratio(numerator: float, denominator: float) -> float:
-    if denominator <= 0:
+def fetch_anomaly_map_for_risk(target_timestamp: datetime) -> dict[tuple[str, str], dict[str, Any]]:
+    rows = fetchall_dicts(
+        """
+        SELECT
+            bucket_start,
+            police_district,
+            incident_category,
+            anomaly,
+            severity
+        FROM anomaly_detections
+        WHERE model_name = %s
+          AND bucket_start = %s;
+        """,
+        (ANOMALY_MODEL_NAME, target_timestamp),
+    )
+
+    output: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        district = row.get("police_district")
+        category = row.get("incident_category")
+        if district and category:
+            output[(district, category)] = row
+    return output
+
+
+def build_risk_groupings(rows: list[dict[str, Any]]) -> dict[str, dict[Any, list[dict[str, Any]]]]:
+    groupings: dict[str, dict[Any, list[dict[str, Any]]]] = {
+        "district_category": {},
+        "category": {},
+        "global": {},
+    }
+
+    for row in rows:
+        district = row.get("police_district")
+        category = row.get("incident_category")
+
+        if district and category:
+            groupings["district_category"].setdefault((district, category), []).append(row)
+
+        if category:
+            groupings["category"].setdefault(category, []).append(row)
+
+        groupings["global"].setdefault("all", []).append(row)
+
+    return groupings
+
+
+def values_for_metric(rows: list[dict[str, Any]], metric: str) -> list[float]:
+    return [safe_float(row.get(metric)) for row in rows]
+
+
+def compute_metric_stats(rows: list[dict[str, Any]]) -> dict[str, dict[str, float]]:
+    stats: dict[str, dict[str, float]] = {}
+
+    for metric in RISK_FEATURE_COLUMNS:
+        values = values_for_metric(rows, metric)
+        avg = mean(values) if values else 0.0
+        std = pstdev(values) if len(values) > 1 else 0.0
+
+        stats[metric] = {
+            "avg": avg,
+            "std": std,
+            "count": float(len(values)),
+        }
+
+    return stats
+
+
+def select_risk_baseline_stats(
+    district: str,
+    category: str,
+    strict_groupings: dict[str, dict[Any, list[dict[str, Any]]]],
+    fallback_groupings: dict[str, dict[Any, list[dict[str, Any]]]],
+    min_history_points: int,
+) -> tuple[dict[str, dict[str, float]], str]:
+    candidates = [
+        ("district_category_strict", strict_groupings["district_category"].get((district, category), [])),
+        ("district_category_fallback", fallback_groupings["district_category"].get((district, category), [])),
+        ("category_strict", strict_groupings["category"].get(category, [])),
+        ("category_fallback", fallback_groupings["category"].get(category, [])),
+        ("global_strict", strict_groupings["global"].get("all", [])),
+        ("global_fallback", fallback_groupings["global"].get("all", [])),
+    ]
+
+    for mode, rows in candidates:
+        if len(rows) >= min_history_points:
+            return compute_metric_stats(rows), mode
+
+    return {}, "insufficient_history"
+
+
+def normalize_metric_against_history(value: float, stats: dict[str, float]) -> float:
+    """
+    Normalizacion calibrada:
+    - value / (avg + 2*std) conserva la idea de volumen absoluto relativo al historial.
+    - z-score premia valores inusualmente altos sin saturar tan rapido como value / max.
+    - Si std es 0 o muy bajo, se usa un piso para evitar divisiones agresivas.
+    """
+    avg = max(0.0, safe_float(stats.get("avg")))
+    std_floor = float(os.environ.get("RISK_STDDEV_FLOOR", str(DEFAULT_RISK_STDDEV_FLOOR)))
+    z_cap = float(os.environ.get("RISK_Z_CAP", str(DEFAULT_RISK_Z_CAP)))
+    std = max(std_floor, safe_float(stats.get("std")))
+
+    expected_high = max(1.0, avg + (2.0 * std))
+    level_component = clamp(value / expected_high, 0.0, 1.0)
+
+    z_score = max(0.0, (value - avg) / std)
+    z_component = clamp(z_score / z_cap, 0.0, 1.0)
+
+    return clamp((0.65 * level_component) + (0.35 * z_component), 0.0, 1.0)
+
+
+def normalize_forecast_component(forecast_row: dict[str, Any] | None) -> float:
+    if not forecast_row:
         return 0.0
-    return clamp(numerator / denominator, 0.0, 1.0)
+
+    predicted_incidents = safe_float(forecast_row.get("predicted_incidents"))
+    lower_bound = safe_float(forecast_row.get("lower_bound"))
+    upper_bound = safe_float(forecast_row.get("upper_bound"))
+
+    spread = max(1.0, upper_bound - lower_bound)
+    z_like = max(0.0, (predicted_incidents - lower_bound) / spread)
+
+    return clamp(z_like, 0.0, 1.0)
 
 
-def compute_risk_score(feature: dict[str, Any], baseline: dict[str, Any] | None, forecast_row: dict[str, Any] | None) -> float:
-    incidents_last_1h = safe_float(feature.get("incidents_last_1h"))
-    incidents_last_24h = safe_float(feature.get("incidents_last_24h"))
-    incidents_last_7d = safe_float(feature.get("incidents_last_7d"))
+def normalize_anomaly_component(anomaly_row: dict[str, Any] | None) -> float:
+    if not anomaly_row:
+        return 0.0
+
+    is_anomaly = bool(anomaly_row.get("anomaly"))
+    severity = str(anomaly_row.get("severity") or "normal").lower()
+
+    if not is_anomaly or severity == "normal":
+        return 0.0
+
+    if severity == "high":
+        return 1.0
+    if severity == "medium":
+        return 0.6
+    if severity == "low":
+        return 0.25
+
+    return 0.0
+
+
+def compute_risk_score(
+    feature: dict[str, Any],
+    baseline_stats: dict[str, dict[str, float]],
+    forecast_row: dict[str, Any] | None,
+    anomaly_row: dict[str, Any] | None,
+) -> float:
+    incidents_last_1h = max(0.0, safe_float(feature.get("incidents_last_1h")))
+    incidents_last_3h = max(0.0, safe_float(feature.get("incidents_last_3h")))
+    incidents_last_6h = max(0.0, safe_float(feature.get("incidents_last_6h")))
+    incidents_last_24h = max(0.0, safe_float(feature.get("incidents_last_24h")))
+    incidents_last_7d = max(0.0, safe_float(feature.get("incidents_last_7d")))
+
     open_ratio = clamp(safe_float(feature.get("open_active_ratio_24h")), 0.0, 1.0)
     online_ratio = clamp(safe_float(feature.get("filed_online_ratio_24h")), 0.0, 1.0)
     avg_delay = max(0.0, safe_float(feature.get("avg_report_delay_minutes_24h")))
 
-    max_1h = max(1.0, safe_float((baseline or {}).get("max_incidents_last_1h"), 1.0))
-    max_24h = max(1.0, safe_float((baseline or {}).get("max_incidents_last_24h"), 1.0))
-    max_7d = max(1.0, safe_float((baseline or {}).get("max_incidents_last_7d"), 1.0))
-    max_delay = max(1.0, safe_float((baseline or {}).get("max_avg_report_delay_minutes_24h"), 1.0))
+    component_1h = normalize_metric_against_history(
+        incidents_last_1h,
+        baseline_stats.get("incidents_last_1h", {}),
+    )
+    component_3h = normalize_metric_against_history(
+        incidents_last_3h,
+        baseline_stats.get("incidents_last_3h", {}),
+    )
+    component_6h = normalize_metric_against_history(
+        incidents_last_6h,
+        baseline_stats.get("incidents_last_6h", {}),
+    )
+    component_24h = normalize_metric_against_history(
+        incidents_last_24h,
+        baseline_stats.get("incidents_last_24h", {}),
+    )
+    component_7d = normalize_metric_against_history(
+        incidents_last_7d,
+        baseline_stats.get("incidents_last_7d", {}),
+    )
+    delay_component = normalize_metric_against_history(
+        avg_delay,
+        baseline_stats.get("avg_report_delay_minutes_24h", {}),
+    )
 
-    recent_1h_component = normalize_ratio(incidents_last_1h, max_1h)
-    recent_24h_component = normalize_ratio(incidents_last_24h, max_24h)
-    recent_7d_component = normalize_ratio(incidents_last_7d, max_7d)
-    delay_component = normalize_ratio(avg_delay, max_delay)
-
-    forecast_component = 0.0
-    if forecast_row:
-        predicted_incidents = safe_float(forecast_row.get("predicted_incidents"))
-        forecast_upper = max(1.0, safe_float(forecast_row.get("upper_bound"), predicted_incidents))
-        forecast_component = normalize_ratio(predicted_incidents, forecast_upper)
+    forecast_component = normalize_forecast_component(forecast_row)
+    anomaly_component = normalize_anomaly_component(anomaly_row)
 
     raw_score = (
-        0.30 * recent_1h_component
-        + 0.25 * recent_24h_component
-        + 0.20 * recent_7d_component
-        + 0.15 * open_ratio
-        + 0.05 * online_ratio
-        + 0.03 * delay_component
-        + 0.02 * forecast_component
+        0.14 * component_1h
+        + 0.14 * component_3h
+        + 0.16 * component_6h
+        + 0.18 * component_24h
+        + 0.12 * component_7d
+        + 0.10 * open_ratio
+        + 0.03 * online_ratio
+        + 0.04 * delay_component
+        + 0.03 * forecast_component
+        + 0.06 * anomaly_component
     )
 
     return round(clamp(raw_score * 100.0, 0.0, 100.0), 4)
 
 
 def map_risk_level(score: float) -> str:
-    if score >= 75:
+    if score >= 85:
         return "Very High"
-    if score >= 50:
+    if score >= 65:
         return "High"
-    if score >= 25:
+    if score >= 40:
         return "Medium"
     return "Low"
 
 
 def build_risk_predictions(generated_at: datetime, target_timestamp: datetime) -> None:
-    lookback_hours = int(os.environ.get("RISK_BASELINE_LOOKBACK_HOURS", str(DEFAULT_RISK_LOOKBACK_HOURS)))
+    history_weeks = int(os.environ.get("RISK_HISTORY_WEEKS", str(DEFAULT_RISK_HISTORY_WEEKS)))
+    min_history_points = int(os.environ.get("RISK_MIN_HISTORY_POINTS", str(DEFAULT_RISK_MIN_HISTORY_POINTS)))
 
     feature_rows = fetch_recent_risk_features(target_timestamp)
-    baseline_rows = fetch_recent_risk_baselines(target_timestamp, lookback_hours)
+    strict_rows = fetch_risk_history_strict(target_timestamp, history_weeks)
+    fallback_rows = fetch_risk_history_fallback(target_timestamp, history_weeks)
     forecast_map = fetch_forecast_map_for_risk(target_timestamp)
+    anomaly_map = fetch_anomaly_map_for_risk(target_timestamp)
 
-    baseline_map: dict[tuple[str, str], dict[str, Any]] = {}
-    for row in baseline_rows:
-        district = row.get("police_district")
-        category = row.get("incident_category")
-        if district and category:
-            baseline_map[(district, category)] = row
+    strict_groupings = build_risk_groupings(strict_rows)
+    fallback_groupings = build_risk_groupings(fallback_rows)
 
     results: list[dict[str, Any]] = []
+    baseline_modes: dict[str, int] = {}
 
     for row in feature_rows:
         district = row.get("police_district")
@@ -532,7 +741,24 @@ def build_risk_predictions(generated_at: datetime, target_timestamp: datetime) -
             continue
 
         key = (district, category)
-        score = compute_risk_score(row, baseline_map.get(key), forecast_map.get(key))
+        baseline_stats, baseline_mode = select_risk_baseline_stats(
+            district=district,
+            category=category,
+            strict_groupings=strict_groupings,
+            fallback_groupings=fallback_groupings,
+            min_history_points=min_history_points,
+        )
+        baseline_modes[baseline_mode] = baseline_modes.get(baseline_mode, 0) + 1
+
+        if not baseline_stats:
+            continue
+
+        score = compute_risk_score(
+            feature=row,
+            baseline_stats=baseline_stats,
+            forecast_row=forecast_map.get(key),
+            anomaly_row=anomaly_map.get(key),
+        )
 
         results.append(
             {
@@ -576,6 +802,7 @@ def build_risk_predictions(generated_at: datetime, target_timestamp: datetime) -
     )
 
     print(f"Risk rows: {len(results)}")
+    print(f"Risk baseline modes: {baseline_modes}")
 
 
 def main() -> None:
@@ -591,6 +818,7 @@ def main() -> None:
     print(f"observed_hour={observed_hour}")
     print(f"risk_hour={risk_hour}")
     print(f"forecast_target={forecast_target}")
+    print(f"risk_model_name={RISK_MODEL_NAME}")
 
     if forecast_target:
         build_forecast_predictions(generated_at, forecast_target)
