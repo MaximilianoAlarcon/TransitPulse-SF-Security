@@ -457,6 +457,108 @@ def read_volume_model_metrics() -> dict[str, Any] | None:
     return json.loads(metrics_path.read_text(encoding="utf-8"))
 
 
+def get_volume_model_path() -> Path:
+    return MODEL_DIR / f"{VOLUME_MODEL_NAME}.joblib"
+
+
+def fetch_latest_volume_features(
+    limit: int,
+    target_timestamp: datetime | None = None,
+    district: str | None = None,
+    category: str | None = None,
+) -> list[dict[str, Any]]:
+    conditions = ["f.feature_timestamp = COALESCE(%s::timestamp, (SELECT MAX(feature_timestamp) FROM risk_features_hourly))"]
+    params: list[Any] = [target_timestamp]
+
+    if district:
+        conditions.append("f.police_district = %s")
+        params.append(district)
+
+    if category:
+        conditions.append("f.incident_category = %s")
+        params.append(category)
+
+    params.append(limit)
+
+    return fetch_all_dict(
+        f"""
+        SELECT
+            f.feature_timestamp,
+            f.police_district,
+            f.incident_category,
+            f.hour_of_day,
+            f.day_of_week,
+            f.month_of_year,
+            COALESCE(f.incidents_last_1h, 0) AS incidents_last_1h,
+            COALESCE(f.incidents_last_3h, 0) AS incidents_last_3h,
+            COALESCE(f.incidents_last_6h, 0) AS incidents_last_6h,
+            COALESCE(f.incidents_last_24h, 0) AS incidents_last_24h,
+            COALESCE(f.incidents_last_7d, 0) AS incidents_last_7d,
+            COALESCE(f.open_active_ratio_24h, 0) AS open_active_ratio_24h,
+            COALESCE(f.filed_online_ratio_24h, 0) AS filed_online_ratio_24h,
+            COALESCE(f.avg_report_delay_minutes_24h, 0) AS avg_report_delay_minutes_24h
+        FROM risk_features_hourly f
+        WHERE {' AND '.join(conditions)}
+          AND COALESCE(f.police_district, '') <> ''
+          AND COALESCE(f.incident_category, '') <> ''
+        ORDER BY f.police_district ASC, f.incident_category ASC
+        LIMIT %s;
+        """,
+        tuple(params),
+    )
+
+
+def predict_volume_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    try:
+        import joblib
+        import pandas as pd
+    except ImportError as exc:
+        raise RuntimeError("Missing ML dependencies. Add pandas and joblib to requirements.txt.") from exc
+
+    model_path = get_volume_model_path()
+    if not model_path.exists():
+        raise FileNotFoundError(f"Trained model not found at {model_path}. Run /admin/ml/volume/train first.")
+
+    if not rows:
+        return {"predictions": [], "row_count": 0, "total_predicted_incidents_next_hour": 0.0}
+
+    model = joblib.load(model_path)
+    df = pd.DataFrame(rows)
+
+    for column in ML_NUMERIC_FEATURES:
+        df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0)
+
+    for column in ML_CATEGORICAL_FEATURES:
+        df[column] = df[column].fillna("Unknown").astype(str)
+
+    feature_columns = ML_NUMERIC_FEATURES + ML_CATEGORICAL_FEATURES
+    predicted_values = model.predict(df[feature_columns])
+
+    predictions: list[dict[str, Any]] = []
+    for row, predicted in zip(rows, predicted_values):
+        predicted_value = max(0.0, float(predicted))
+        feature_timestamp = row.get("feature_timestamp")
+        forecast_for = feature_timestamp + timedelta(hours=1) if feature_timestamp else None
+
+        predictions.append(
+            {
+                "feature_timestamp": feature_timestamp.isoformat() if feature_timestamp else None,
+                "forecast_for": forecast_for.isoformat() if forecast_for else None,
+                "police_district": row.get("police_district"),
+                "incident_category": row.get("incident_category"),
+                "predicted_incidents_next_hour": round(predicted_value, 4),
+            }
+        )
+
+    predictions.sort(key=lambda item: item["predicted_incidents_next_hour"], reverse=True)
+
+    return {
+        "row_count": len(predictions),
+        "predictions": predictions,
+        "total_predicted_incidents_next_hour": round(sum(item["predicted_incidents_next_hour"] for item in predictions), 4),
+    }
+
+
 @app.route("/")
 def dashboard():
     return render_template("index.html")
@@ -1031,6 +1133,52 @@ def admin_ml_volume_model_info():
         return jsonify({"status": "not_found", "message": "No trained volume model metrics found yet.", "model_name": VOLUME_MODEL_NAME, "model_dir": str(MODEL_DIR)}), 404
 
     return jsonify(metrics)
+
+
+@app.route("/admin/ml/volume/predict", methods=["POST"])
+@require_admin_token
+def admin_ml_volume_predict():
+    payload = parse_admin_json_payload()
+    limit = parse_positive_int(payload.get("limit"), default=200, min_value=1, max_value=5000)
+    district = (payload.get("district") or "").strip() or None
+    category = (payload.get("category") or "").strip() or None
+
+    target_timestamp = None
+    raw_target_timestamp = (payload.get("target_timestamp") or "").strip()
+    if raw_target_timestamp:
+        try:
+            target_timestamp = datetime.fromisoformat(raw_target_timestamp.replace("Z", "+00:00")).replace(tzinfo=None)
+        except ValueError:
+            return jsonify({"status": "error", "message": "Invalid target_timestamp. Use ISO format, for example 2026-04-24T22:00:00."}), 400
+
+    try:
+        rows = fetch_latest_volume_features(
+            limit=limit,
+            target_timestamp=target_timestamp,
+            district=district,
+            category=category,
+        )
+        result = predict_volume_from_rows(rows)
+        metrics = read_volume_model_metrics()
+        model_path = get_volume_model_path()
+
+        return jsonify(
+            {
+                "status": "ok",
+                "model_name": VOLUME_MODEL_NAME,
+                "model_path": str(model_path),
+                "model_generated_at": metrics.get("generated_at") if metrics else None,
+                "filters": {
+                    "target_timestamp": target_timestamp.isoformat() if target_timestamp else "latest",
+                    "district": district or "all",
+                    "category": category or "all",
+                    "limit": limit,
+                },
+                **result,
+            }
+        )
+    except Exception as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 500
 
 
 if __name__ == "__main__":
