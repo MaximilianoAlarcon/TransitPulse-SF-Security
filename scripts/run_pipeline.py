@@ -4,8 +4,7 @@ import subprocess
 import sys
 from datetime import datetime
 
-# Centralized category allowlist for crime-focused ETLs.
-# Edit this list here and rerun the pipeline.
+
 CATEGORY_FILTER_VALUES = [
     "Larceny Theft",
     "Drug Offense",
@@ -32,6 +31,7 @@ CATEGORY_FILTER_VALUES = [
     "Sex Offense",
 ]
 
+
 SCRIPTS = [
     "scripts/load_incidents.py",
     "scripts/refresh_hourly_aggregates.py",
@@ -42,9 +42,25 @@ SCRIPTS = [
 ]
 
 
-def build_script_env() -> dict[str, str]:
+def build_script_env(mode: str) -> dict[str, str]:
     env = os.environ.copy()
+
+    # filtro de categorias
     env["CATEGORY_FILTER_VALUES_JSON"] = json.dumps(CATEGORY_FILTER_VALUES)
+
+    if mode == "backfill":
+        print("⚠️ Running BACKFILL mode (6 months)")
+
+        env["FORCE_HISTORY_BACKFILL"] = "true"
+        env["HISTORY_LOOKBACK_MONTHS"] = "6"
+        env["HISTORY_LOOKBACK_INTERVAL"] = "6 months"
+
+    else:
+        print("⚡ Running INCREMENTAL mode (48 hours)")
+
+        env["FORCE_HISTORY_BACKFILL"] = "false"
+        env["HISTORY_LOOKBACK_INTERVAL"] = "48 hours"
+
     return env
 
 
@@ -76,12 +92,12 @@ def run_script(script: str, env: dict[str, str]) -> None:
 
 
 def main() -> None:
-    env = build_script_env()
+    mode = os.environ.get("PIPELINE_MODE", "incremental")
+
+    env = build_script_env(mode)
 
     print("===== START PIPELINE =====")
-    print("Crime category filter enabled with these categories:")
-    for category in CATEGORY_FILTER_VALUES:
-        print(f" - {category}")
+    print(f"Mode: {mode}")
 
     for script in SCRIPTS:
         run_script(script, env)

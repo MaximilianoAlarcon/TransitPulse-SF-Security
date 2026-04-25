@@ -1,12 +1,17 @@
 import json
 import os
 import sys
+
 CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(CURRENT_DIR)
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
 from utils import execute_etl_query
+
+LOOKBACK_INTERVAL = os.environ.get("RISK_FEATURES_LOOKBACK_INTERVAL", os.environ.get("HISTORY_LOOKBACK_INTERVAL", "6 months"))
+END_INTERVAL = os.environ.get("RISK_FEATURES_END_INTERVAL", "0 hours")
+WARMUP_INTERVAL = os.environ.get("RISK_FEATURES_WARMUP_INTERVAL", "9 days")
 
 
 def load_category_filter() -> list[str]:
@@ -22,45 +27,65 @@ def sql_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def build_category_condition(alias: str) -> str:
+def sql_interval(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def build_category_condition(alias: str, indentation: str = "  ") -> str:
     categories = load_category_filter()
     if not categories:
         return ""
     values = ", ".join(sql_quote(category) for category in categories)
-    return f"\n      AND COALESCE({alias}.incident_category, 'Unknown') IN ({values})"
+    return f"\n{indentation}AND COALESCE({alias}.incident_category, 'Unknown') IN ({values})"
 
 
-HOURLY_CATEGORY_CONDITION = build_category_condition("ich")
-DELAY_CATEGORY_CONDITION = build_category_condition("r")
-FEATURE_CATEGORY_CONDITION = build_category_condition("h")
+FEATURE_CATEGORY_CONDITION = build_category_condition("h", "    ")
+DELAY_CATEGORY_CONDITION = build_category_condition("r", "      ")
+HOURLY_CATEGORY_CONDITION = build_category_condition("ich", "   ")
 
 SQL = f"""
 BEGIN;
 
-DELETE FROM risk_features_hourly
-WHERE feature_timestamp >= date_trunc('hour', NOW() - INTERVAL '48 hours');
+WITH params AS (
+    SELECT
+        date_trunc('hour', NOW() - INTERVAL {sql_interval(LOOKBACK_INTERVAL)}) AS start_ts,
+        date_trunc('hour', NOW() - INTERVAL {sql_interval(END_INTERVAL)}) AS end_ts
+)
+DELETE FROM risk_features_hourly rf
+USING params p
+WHERE rf.feature_timestamp >= p.start_ts
+  AND rf.feature_timestamp <  p.end_ts + INTERVAL '1 hour';
 
-WITH feature_hours AS (
+WITH params AS (
+    SELECT
+        date_trunc('hour', NOW() - INTERVAL {sql_interval(LOOKBACK_INTERVAL)}) AS start_ts,
+        date_trunc('hour', NOW() - INTERVAL {sql_interval(END_INTERVAL)}) AS end_ts,
+        INTERVAL {sql_interval(WARMUP_INTERVAL)} AS warmup_interval
+),
+feature_hours AS (
     SELECT DISTINCT
-        bucket_start AS feature_timestamp,
-        police_district,
-        incident_category
+        h.bucket_start AS feature_timestamp,
+        h.police_district,
+        h.incident_category
     FROM incident_counts_hourly h
-    WHERE bucket_start >= date_trunc('hour', NOW() - INTERVAL '48 hours'){FEATURE_CATEGORY_CONDITION}
+    CROSS JOIN params p
+    WHERE h.bucket_start >= p.start_ts
+      AND h.bucket_start <  p.end_ts + INTERVAL '1 hour'{FEATURE_CATEGORY_CONDITION}
 ),
 delay_hourly AS (
     SELECT
-        date_trunc('hour', incident_datetime) AS bucket_start,
-        COALESCE(police_district, 'Unknown') AS police_district,
-        COALESCE(incident_category, 'Unknown') AS incident_category,
-        SUM(report_delay_minutes) AS sum_report_delay_minutes,
-        COUNT(report_delay_minutes) AS count_report_delay_minutes
+        date_trunc('hour', r.incident_datetime) AS bucket_start,
+        COALESCE(r.police_district, 'Unknown') AS police_district,
+        COALESCE(r.incident_category, 'Unknown') AS incident_category,
+        SUM(r.report_delay_minutes) AS sum_report_delay_minutes,
+        COUNT(r.report_delay_minutes) AS count_report_delay_minutes
     FROM incidents_raw r
-    WHERE incident_datetime IS NOT NULL
-      AND incident_datetime >= date_trunc('hour', NOW() - INTERVAL '9 days'){DELAY_CATEGORY_CONDITION}
+    CROSS JOIN params p
+    WHERE r.incident_datetime IS NOT NULL
+      AND r.incident_datetime >= p.start_ts - p.warmup_interval
+      AND r.incident_datetime <  p.end_ts + INTERVAL '1 hour'{DELAY_CATEGORY_CONDITION}
     GROUP BY 1,2,3
 )
-
 INSERT INTO risk_features_hourly (
     feature_timestamp,
     police_district,
@@ -163,7 +188,6 @@ SELECT
                   AND dh.bucket_start <  fh.feature_timestamp + INTERVAL '1 hour'
             )::double precision
     END AS avg_report_delay_minutes_24h
-
 FROM feature_hours fh
 LEFT JOIN incident_counts_hourly ich
     ON ich.police_district = fh.police_district
@@ -184,4 +208,5 @@ COMMIT;
 """
 
 if __name__ == "__main__":
+    print(f"Rebuilding risk_features_hourly with lookback interval: {LOOKBACK_INTERVAL}")
     execute_etl_query(SQL)

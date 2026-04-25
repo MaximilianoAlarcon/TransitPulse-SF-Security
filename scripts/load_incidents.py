@@ -1,7 +1,6 @@
-import json
 import os
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import requests
@@ -13,10 +12,11 @@ if PROJECT_ROOT not in sys.path:
 
 from utils import get_db_connection
 
-BASE_API_URL = "https://data.sfgov.org/resource/wg3w-h783.json"
-PAGE_SIZE = 1000
-OVERLAP_HOURS = 2
-BACKFILL_BATCH_SIZE = 200
+BASE_API_URL = os.environ.get("SFPD_INCIDENTS_API_URL")
+PAGE_SIZE = int(os.environ.get("SOCRATA_PAGE_SIZE", "1000"))
+OVERLAP_HOURS = int(os.environ.get("INCIDENTS_OVERLAP_HOURS", "2"))
+BACKFILL_BATCH_SIZE = int(os.environ.get("BACKFILL_BATCH_SIZE", "200"))
+DEFAULT_LOOKBACK_MONTHS = int(os.environ.get("HISTORY_LOOKBACK_MONTHS", "6"))
 
 EXPECTED_FIELDS = [
     "row_id",
@@ -42,6 +42,52 @@ EXPECTED_FIELDS = [
     "latitude",
     "longitude",
 ]
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def add_months(dt: datetime, months: int) -> datetime:
+    month = dt.month - 1 + months
+    year = dt.year + month // 12
+    month = month % 12 + 1
+    days_in_month = [31, 29 if year % 4 == 0 and (year % 100 != 0 or year % 400 == 0) else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    day = min(dt.day, days_in_month[month - 1])
+    return dt.replace(year=year, month=month, day=day)
+
+
+def parse_datetime(value: str) -> datetime:
+    cleaned = value.strip().replace("Z", "+00:00")
+    if "T" not in cleaned and len(cleaned) == 10:
+        cleaned = f"{cleaned}T00:00:00"
+    dt = datetime.fromisoformat(cleaned)
+    if dt.tzinfo is not None:
+        dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+    return dt
+
+
+def get_requested_start_datetime(last_dt: datetime | None) -> datetime:
+    explicit_start = os.environ.get("INCIDENTS_START_DATE") or os.environ.get("HISTORY_START_DATE")
+    force_history_backfill = env_bool("FORCE_HISTORY_BACKFILL", default=False)
+
+    if explicit_start:
+        return parse_datetime(explicit_start)
+
+    if last_dt is not None and not force_history_backfill:
+        return last_dt - timedelta(hours=OVERLAP_HOURS)
+
+    return add_months(datetime.utcnow(), -DEFAULT_LOOKBACK_MONTHS)
+
+
+def get_requested_end_datetime() -> datetime | None:
+    explicit_end = os.environ.get("INCIDENTS_END_DATE") or os.environ.get("HISTORY_END_DATE")
+    if not explicit_end:
+        return None
+    return parse_datetime(explicit_end)
 
 
 def safe_float(value: Any) -> float | None:
@@ -98,10 +144,8 @@ def get_last_incident_datetime() -> datetime | None:
             with conn.cursor() as cur:
                 cur.execute(query)
                 result = cur.fetchone()
-
                 if not result:
                     return None
-
                 if isinstance(result, dict):
                     return result.get("max_incident_datetime")
                 return result[0]
@@ -126,10 +170,7 @@ def get_missing_coordinate_row_ids(limit: int = 5000) -> list[str]:
                 rows = cur.fetchall()
                 values = []
                 for row in rows:
-                    if isinstance(row, dict):
-                        values.append(row.get("row_id"))
-                    else:
-                        values.append(row[0])
+                    values.append(row.get("row_id") if isinstance(row, dict) else row[0])
                 return [value for value in values if value]
     finally:
         conn.close()
@@ -139,23 +180,25 @@ def format_socrata_datetime(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%S")
 
 
-def fetch_rows_since(last_dt: datetime | None) -> list[dict[str, Any]]:
+def build_where_clause(start_dt: datetime, end_dt: datetime | None) -> str:
+    conditions = [f"incident_datetime >= '{format_socrata_datetime(start_dt)}'"]
+    if end_dt is not None:
+        conditions.append(f"incident_datetime < '{format_socrata_datetime(end_dt)}'")
+    return " AND ".join(conditions)
+
+
+def fetch_rows_between(start_dt: datetime, end_dt: datetime | None) -> list[dict[str, Any]]:
     all_rows: list[dict[str, Any]] = []
     offset = 0
 
     params = {
         "$limit": PAGE_SIZE,
-        "$offset": offset,
         "$order": "incident_datetime ASC",
+        "$where": build_where_clause(start_dt, end_dt),
     }
-
-    if last_dt is not None:
-        safe_dt = last_dt - timedelta(hours=OVERLAP_HOURS)
-        params["$where"] = f"incident_datetime >= '{format_socrata_datetime(safe_dt)}'"
 
     while True:
         params["$offset"] = offset
-
         response = requests.get(BASE_API_URL, params=params, timeout=60)
         response.raise_for_status()
 
@@ -164,15 +207,10 @@ def fetch_rows_since(last_dt: datetime | None) -> list[dict[str, Any]]:
             break
 
         all_rows.extend(page_rows)
-
-        print(
-            f"Fetched {len(page_rows)} rows "
-            f"(offset={offset}, total_so_far={len(all_rows)})"
-        )
+        print(f"Fetched {len(page_rows)} rows (offset={offset}, total_so_far={len(all_rows)})")
 
         if len(page_rows) < PAGE_SIZE:
             break
-
         offset += PAGE_SIZE
 
     return all_rows
@@ -317,7 +355,6 @@ def backfill_missing_coordinates(limit: int = 5000) -> None:
         return
 
     print(f"Found {len(missing_row_ids)} rows with missing coordinates to backfill.")
-
     total_processed = 0
     for start in range(0, len(missing_row_ids), BACKFILL_BATCH_SIZE):
         batch_ids = missing_row_ids[start:start + BACKFILL_BATCH_SIZE]
@@ -330,11 +367,14 @@ def backfill_missing_coordinates(limit: int = 5000) -> None:
 
 def load_incidents() -> None:
     last_dt = get_last_incident_datetime()
+    start_dt = get_requested_start_datetime(last_dt)
+    end_dt = get_requested_end_datetime()
+
     print(f"Last incident_datetime in DB: {last_dt}")
+    print(f"Loading incidents from {start_dt} to {end_dt or 'now/open-ended'}")
 
-    rows = fetch_rows_since(last_dt)
+    rows = fetch_rows_between(start_dt, end_dt)
     print(f"Total fetched from API: {len(rows)}")
-
     upsert_rows(rows)
 
     backfill_limit = int(os.environ.get("BACKFILL_MISSING_COORDS_LIMIT", "0"))
