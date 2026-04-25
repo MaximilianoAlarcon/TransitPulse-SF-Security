@@ -3,6 +3,8 @@ import io
 import json
 import math
 import os
+import subprocess
+import sys
 import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -104,6 +106,53 @@ CATEGORY_FILTER_VALUES = [
     "Sex Offense",
 ]
 
+
+
+ALLOWED_ADMIN_ETL_COMMANDS = {
+    "build_risk_features": {
+        "script": "scripts/build_risk_features.py",
+        "allowed_env": {
+            "RISK_FEATURES_FULL_GRID",
+            "RISK_FEATURES_LOOKBACK_INTERVAL",
+            "RISK_FEATURES_END_INTERVAL",
+            "RISK_FEATURES_WARMUP_INTERVAL",
+            "HISTORY_LOOKBACK_INTERVAL",
+        },
+        "default_env": {
+            "RISK_FEATURES_FULL_GRID": "true",
+            "RISK_FEATURES_LOOKBACK_INTERVAL": "6 months",
+        },
+    },
+    "build_forecast_series": {
+        "script": "scripts/build_forecast_series.py",
+        "allowed_env": {
+            "FORECAST_SERIES_LOOKBACK_INTERVAL",
+            "HISTORY_LOOKBACK_INTERVAL",
+        },
+        "default_env": {},
+    },
+    "refresh_hourly_aggregates": {
+        "script": "scripts/refresh_hourly_aggregates.py",
+        "allowed_env": {
+            "HOURLY_AGG_LOOKBACK_INTERVAL",
+            "HISTORY_LOOKBACK_INTERVAL",
+        },
+        "default_env": {},
+    },
+    "build_predictions": {
+        "script": "scripts/build_predictions.py",
+        "allowed_env": {
+            "RISK_MODEL_NAME",
+            "RISK_HISTORY_WEEKS",
+            "RISK_MIN_HISTORY_POINTS",
+            "FORECAST_HISTORY_WEEKS",
+            "FORECAST_MIN_HISTORY_POINTS",
+        },
+        "default_env": {},
+    },
+}
+
+ADMIN_ETL_MAX_TIMEOUT_SECONDS = int(os.environ.get("ADMIN_ETL_MAX_TIMEOUT_SECONDS", "1800"))
 
 def fetch_all_dict(query: str, params: tuple[Any, ...] = ()) -> list[dict[str, Any]]:
     with get_db_connection() as conn:
@@ -287,6 +336,69 @@ def parse_float_range(value: Any, default: float, min_value: float, max_value: f
         parsed = default
     return max(min_value, min(max_value, parsed))
 
+
+
+def build_category_filter_env() -> str:
+    return json.dumps(CATEGORY_FILTER_VALUES)
+
+
+def run_allowed_admin_etl(command_name: str, extra_env: dict[str, Any] | None, timeout_seconds: int) -> dict[str, Any]:
+    if command_name not in ALLOWED_ADMIN_ETL_COMMANDS:
+        allowed = sorted(ALLOWED_ADMIN_ETL_COMMANDS.keys())
+        raise ValueError(f"Invalid command '{command_name}'. Allowed commands: {allowed}")
+
+    command_config = ALLOWED_ADMIN_ETL_COMMANDS[command_name]
+    script_path = BASE_DIR / command_config["script"]
+    if not script_path.exists():
+        raise FileNotFoundError(f"Script not found: {script_path}")
+
+    allowed_env = command_config["allowed_env"]
+    sanitized_env: dict[str, str] = {}
+
+    for key, value in command_config.get("default_env", {}).items():
+        sanitized_env[key] = str(value)
+
+    for key, value in (extra_env or {}).items():
+        if key not in allowed_env:
+            raise ValueError(f"Environment variable '{key}' is not allowed for command '{command_name}'.")
+        sanitized_env[key] = str(value)
+
+    env = os.environ.copy()
+    env.update(sanitized_env)
+    env["CATEGORY_FILTER_VALUES_JSON"] = build_category_filter_env()
+
+    safe_timeout = max(1, min(int(timeout_seconds), ADMIN_ETL_MAX_TIMEOUT_SECONDS))
+    started_at = datetime.utcnow().replace(microsecond=0)
+
+    result = subprocess.run(
+        [sys.executable, str(script_path)],
+        cwd=str(BASE_DIR),
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=safe_timeout,
+    )
+
+    finished_at = datetime.utcnow().replace(microsecond=0)
+    stdout = result.stdout or ""
+    stderr = result.stderr or ""
+
+    response = {
+        "command": command_name,
+        "script": command_config["script"],
+        "started_at": started_at.isoformat(),
+        "finished_at": finished_at.isoformat(),
+        "duration_seconds": round((finished_at - started_at).total_seconds(), 3),
+        "returncode": result.returncode,
+        "env_overrides": sanitized_env,
+        "stdout": stdout[-12000:],
+        "stderr": stderr[-12000:],
+    }
+
+    if result.returncode != 0:
+        raise RuntimeError(json.dumps(response, default=str))
+
+    return response
 
 def fetch_volume_ml_dataset(lookback_days: int) -> list[dict[str, Any]]:
     return fetch_all_dict(
@@ -1346,6 +1458,40 @@ def admin_ml_volume_predict():
         )
     except Exception as exc:
         return jsonify({"status": "error", "message": str(exc)}), 500
+
+
+@app.route("/admin/etl/run", methods=["POST"])
+@require_admin_token
+def admin_etl_run():
+    payload = parse_admin_json_payload()
+    command_name = (payload.get("command") or "").strip()
+    extra_env = payload.get("env") or {}
+    timeout_seconds = parse_positive_int(
+        payload.get("timeout_seconds"),
+        default=min(ADMIN_ETL_MAX_TIMEOUT_SECONDS, 1800),
+        min_value=1,
+        max_value=ADMIN_ETL_MAX_TIMEOUT_SECONDS,
+    )
+
+    if not isinstance(extra_env, dict):
+        return jsonify({"status": "error", "message": "env must be a JSON object."}), 400
+
+    try:
+        result = run_allowed_admin_etl(
+            command_name=command_name,
+            extra_env=extra_env,
+            timeout_seconds=timeout_seconds,
+        )
+        return jsonify({"status": "ok", **result})
+    except RuntimeError as exc:
+        message = str(exc)
+        try:
+            details = json.loads(message)
+            return jsonify({"status": "error", "message": "ETL command failed.", "details": details}), 500
+        except Exception:
+            return jsonify({"status": "error", "message": message}), 500
+    except Exception as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
 
 
 if __name__ == "__main__":
