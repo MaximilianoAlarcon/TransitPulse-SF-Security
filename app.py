@@ -65,6 +65,18 @@ ML_CATEGORICAL_FEATURES = [
 
 ML_TARGET_COLUMN = "target_incidents_next_hour"
 
+# Railway Bucket / S3-compatible storage for trained model artifacts.
+MODEL_BUCKET_NAME = os.environ.get("AWS_S3_BUCKET_NAME")
+MODEL_BUCKET_ENDPOINT_URL = os.environ.get("AWS_ENDPOINT_URL")
+MODEL_BUCKET_REGION = os.environ.get("AWS_DEFAULT_REGION", "auto")
+MODEL_S3_PREFIX = os.environ.get("MODEL_S3_PREFIX", "models")
+
+# In-memory cache to avoid downloading/loading the model on every prediction request.
+VOLUME_MODEL_CACHE: dict[str, Any] = {
+    "model": None,
+    "source": None,
+}
+
 
 CATEGORY_FILTER_VALUES = [
     "Larceny Theft",
@@ -345,6 +357,135 @@ def summarize_volume_ml_dataset(rows: list[dict[str, Any]], lookback_days: int) 
     }
 
 
+def get_model_artifact_keys() -> dict[str, str]:
+    return {
+        "model": f"{MODEL_S3_PREFIX.rstrip('/')}/{VOLUME_MODEL_NAME}.joblib",
+        "metrics": f"{MODEL_S3_PREFIX.rstrip('/')}/{VOLUME_MODEL_NAME}_metrics.json",
+    }
+
+
+def get_s3_client() -> Any:
+    try:
+        import boto3
+    except ImportError as exc:
+        raise RuntimeError("Missing S3 dependency. Add boto3 to requirements.txt.") from exc
+
+    if not MODEL_BUCKET_NAME:
+        raise RuntimeError("AWS_S3_BUCKET_NAME is not configured.")
+    if not MODEL_BUCKET_ENDPOINT_URL:
+        raise RuntimeError("AWS_ENDPOINT_URL is not configured.")
+
+    return boto3.client(
+        "s3",
+        endpoint_url=MODEL_BUCKET_ENDPOINT_URL,
+        region_name=MODEL_BUCKET_REGION,
+        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+    )
+
+
+def upload_bytes_to_model_bucket(key: str, data: bytes, content_type: str) -> None:
+    client = get_s3_client()
+    client.put_object(
+        Bucket=MODEL_BUCKET_NAME,
+        Key=key,
+        Body=data,
+        ContentType=content_type,
+    )
+
+
+def download_bytes_from_model_bucket(key: str) -> bytes:
+    client = get_s3_client()
+    response = client.get_object(Bucket=MODEL_BUCKET_NAME, Key=key)
+    return response["Body"].read()
+
+
+def upload_volume_model_artifacts(model_path: Path, metrics_path: Path) -> dict[str, Any]:
+    keys = get_model_artifact_keys()
+
+    if not model_path.exists():
+        raise FileNotFoundError(f"Local model artifact not found at {model_path}.")
+    if not metrics_path.exists():
+        raise FileNotFoundError(f"Local metrics artifact not found at {metrics_path}.")
+
+    upload_bytes_to_model_bucket(
+        key=keys["model"],
+        data=model_path.read_bytes(),
+        content_type="application/octet-stream",
+    )
+    upload_bytes_to_model_bucket(
+        key=keys["metrics"],
+        data=metrics_path.read_bytes(),
+        content_type="application/json",
+    )
+
+    return {
+        "bucket": MODEL_BUCKET_NAME,
+        "endpoint_url": MODEL_BUCKET_ENDPOINT_URL,
+        "model_key": keys["model"],
+        "metrics_key": keys["metrics"],
+    }
+
+
+def read_volume_model_metrics_from_bucket() -> dict[str, Any] | None:
+    keys = get_model_artifact_keys()
+    try:
+        raw = download_bytes_from_model_bucket(keys["metrics"])
+    except Exception:
+        return None
+    return json.loads(raw.decode("utf-8"))
+
+
+def load_volume_model_from_bucket() -> Any:
+    try:
+        import joblib
+    except ImportError as exc:
+        raise RuntimeError("Missing ML dependency. Add joblib to requirements.txt.") from exc
+
+    keys = get_model_artifact_keys()
+    raw = download_bytes_from_model_bucket(keys["model"])
+    return joblib.load(io.BytesIO(raw))
+
+
+def load_volume_model() -> tuple[Any, str]:
+    """
+    Load model for inference.
+    Priority:
+    1. in-memory cache
+    2. local filesystem cache
+    3. Railway Bucket / S3-compatible storage
+    """
+    cached_model = VOLUME_MODEL_CACHE.get("model")
+    cached_source = VOLUME_MODEL_CACHE.get("source")
+    if cached_model is not None:
+        return cached_model, str(cached_source or "memory_cache")
+
+    try:
+        import joblib
+    except ImportError as exc:
+        raise RuntimeError("Missing ML dependency. Add joblib to requirements.txt.") from exc
+
+    model_path = get_volume_model_path()
+    if model_path.exists():
+        model = joblib.load(model_path)
+        VOLUME_MODEL_CACHE["model"] = model
+        VOLUME_MODEL_CACHE["source"] = str(model_path)
+        return model, str(model_path)
+
+    model = load_volume_model_from_bucket()
+    VOLUME_MODEL_CACHE["model"] = model
+    VOLUME_MODEL_CACHE["source"] = f"s3://{MODEL_BUCKET_NAME}/{get_model_artifact_keys()['model']}"
+
+    # Optional local cache for the lifetime of the container.
+    try:
+        MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        joblib.dump(model, model_path)
+    except Exception:
+        pass
+
+    return model, str(VOLUME_MODEL_CACHE["source"])
+
+
 def train_volume_forecast_model(rows: list[dict[str, Any]], test_size: float) -> dict[str, Any]:
     try:
         import joblib
@@ -447,14 +588,27 @@ def train_volume_forecast_model(rows: list[dict[str, Any]], test_size: float) ->
     }
 
     metrics_path.write_text(json.dumps(metrics, indent=2, default=str), encoding="utf-8")
+
+    storage: dict[str, Any] = {"local_model_path": str(model_path), "local_metrics_path": str(metrics_path)}
+    if MODEL_BUCKET_NAME and MODEL_BUCKET_ENDPOINT_URL:
+        storage["s3"] = upload_volume_model_artifacts(model_path=model_path, metrics_path=metrics_path)
+
+    VOLUME_MODEL_CACHE["model"] = model
+    VOLUME_MODEL_CACHE["source"] = str(model_path)
+
+    metrics["storage"] = storage
     return metrics
 
 
 def read_volume_model_metrics() -> dict[str, Any] | None:
     metrics_path = MODEL_DIR / f"{VOLUME_MODEL_NAME}_metrics.json"
-    if not metrics_path.exists():
-        return None
-    return json.loads(metrics_path.read_text(encoding="utf-8"))
+    if metrics_path.exists():
+        return json.loads(metrics_path.read_text(encoding="utf-8"))
+
+    if MODEL_BUCKET_NAME and MODEL_BUCKET_ENDPOINT_URL:
+        return read_volume_model_metrics_from_bucket()
+
+    return None
 
 
 def get_volume_model_path() -> Path:
@@ -515,14 +669,18 @@ def predict_volume_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     except ImportError as exc:
         raise RuntimeError("Missing ML dependencies. Add pandas and joblib to requirements.txt.") from exc
 
-    model_path = get_volume_model_path()
-    if not model_path.exists():
-        raise FileNotFoundError(f"Trained model not found at {model_path}. Run /admin/ml/volume/train first.")
-
     if not rows:
-        return {"predictions": [], "row_count": 0, "total_predicted_incidents_next_hour": 0.0}
+        return {"predictions": [], "row_count": 0, "total_predicted_incidents_next_hour": 0.0, "model_source": None}
 
-    model = joblib.load(model_path)
+    try:
+        model, model_source = load_volume_model()
+    except Exception as exc:
+        raise FileNotFoundError(
+            "Trained model could not be loaded from local filesystem or Railway Bucket. "
+            "Run /admin/ml/volume/train first and verify AWS_* bucket variables. "
+            f"Details: {exc}"
+        ) from exc
+
     df = pd.DataFrame(rows)
 
     for column in ML_NUMERIC_FEATURES:
@@ -556,6 +714,7 @@ def predict_volume_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "row_count": len(predictions),
         "predictions": predictions,
         "total_predicted_incidents_next_hour": round(sum(item["predicted_incidents_next_hour"] for item in predictions), 4),
+        "model_source": model_source,
     }
 
 
@@ -1130,7 +1289,14 @@ def admin_ml_volume_train():
 def admin_ml_volume_model_info():
     metrics = read_volume_model_metrics()
     if not metrics:
-        return jsonify({"status": "not_found", "message": "No trained volume model metrics found yet.", "model_name": VOLUME_MODEL_NAME, "model_dir": str(MODEL_DIR)}), 404
+        return jsonify({
+            "status": "not_found",
+            "message": "No trained volume model metrics found yet.",
+            "model_name": VOLUME_MODEL_NAME,
+            "model_dir": str(MODEL_DIR),
+            "bucket": MODEL_BUCKET_NAME,
+            "model_key": get_model_artifact_keys()["model"],
+        }), 404
 
     return jsonify(metrics)
 
@@ -1167,6 +1333,7 @@ def admin_ml_volume_predict():
                 "status": "ok",
                 "model_name": VOLUME_MODEL_NAME,
                 "model_path": str(model_path),
+                "model_source": result.get("model_source"),
                 "model_generated_at": metrics.get("generated_at") if metrics else None,
                 "filters": {
                     "target_timestamp": target_timestamp.isoformat() if target_timestamp else "latest",
