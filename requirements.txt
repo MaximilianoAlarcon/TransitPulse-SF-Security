@@ -2,3 +2,6 @@ Flask==3.0.3
 gunicorn==22.0.0
 psycopg2-binary==2.9.9
 requests
+pandas
+scikit-learn
+joblib

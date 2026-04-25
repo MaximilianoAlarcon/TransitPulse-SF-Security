@@ -1,10 +1,13 @@
 import csv
 import io
+import json
+import math
 import os
 import zipfile
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any
+from functools import wraps
+from typing import Any, Callable
 
 from flask import Flask, Response, jsonify, render_template, request
 from psycopg2.extras import RealDictCursor
@@ -34,6 +37,33 @@ WINDOW_TO_DELTA = {
 
 SF_CENTER = {"lat": 37.7749, "lon": -122.4194}
 MAP_POINT_LIMIT = 600
+
+MODEL_DIR = Path(os.environ.get("MODEL_DIR", BASE_DIR / "models"))
+VOLUME_MODEL_NAME = os.environ.get("VOLUME_MODEL_NAME", "volume_random_forest_v1")
+DEFAULT_ML_LOOKBACK_DAYS = int(os.environ.get("ML_LOOKBACK_DAYS", "180"))
+DEFAULT_ML_TEST_SIZE = float(os.environ.get("ML_TEST_SIZE", "0.2"))
+DEFAULT_ML_MIN_ROWS = int(os.environ.get("ML_MIN_ROWS", "200"))
+
+ML_NUMERIC_FEATURES = [
+    "hour_of_day",
+    "month_of_year",
+    "incidents_last_1h",
+    "incidents_last_3h",
+    "incidents_last_6h",
+    "incidents_last_24h",
+    "incidents_last_7d",
+    "open_active_ratio_24h",
+    "filed_online_ratio_24h",
+    "avg_report_delay_minutes_24h",
+]
+
+ML_CATEGORICAL_FEATURES = [
+    "police_district",
+    "incident_category",
+    "day_of_week",
+]
+
+ML_TARGET_COLUMN = "target_incidents_next_hour"
 
 
 CATEGORY_FILTER_VALUES = [
@@ -201,6 +231,230 @@ def compute_point_risk(row: dict[str, Any], risk_mode: str) -> tuple[float, str]
         label = "Volume"
 
     return max(0.0, min(1.0, score)), label
+
+
+def require_admin_token(func: Callable[..., Any]) -> Callable[..., Any]:
+    @wraps(func)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        expected_token = os.environ.get("ADMIN_TOKEN")
+        if not expected_token:
+            return jsonify({"status": "error", "message": "ADMIN_TOKEN is not configured. Set it in Railway before using admin ML endpoints."}), 500
+
+        header_token = request.headers.get("X-Admin-Token") or ""
+        auth_header = request.headers.get("Authorization") or ""
+        bearer_token = auth_header.removeprefix("Bearer ").strip() if auth_header.startswith("Bearer ") else ""
+        provided_token = header_token.strip() or bearer_token
+
+        if provided_token != expected_token:
+            return jsonify({"status": "error", "message": "Unauthorized"}), 401
+
+        return func(*args, **kwargs)
+
+    return wrapper
+
+
+def parse_admin_json_payload() -> dict[str, Any]:
+    return request.get_json(silent=True) or {}
+
+
+def parse_positive_int(value: Any, default: int, min_value: int = 1, max_value: int | None = None) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        parsed = default
+    parsed = max(min_value, parsed)
+    if max_value is not None:
+        parsed = min(parsed, max_value)
+    return parsed
+
+
+def parse_float_range(value: Any, default: float, min_value: float, max_value: float) -> float:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        parsed = default
+    return max(min_value, min(max_value, parsed))
+
+
+def fetch_volume_ml_dataset(lookback_days: int) -> list[dict[str, Any]]:
+    return fetch_all_dict(
+        """
+        WITH next_counts AS (
+            SELECT
+                bucket_start,
+                police_district,
+                incident_category,
+                SUM(total_incidents) AS total_incidents
+            FROM incident_counts_hourly
+            GROUP BY 1,2,3
+        ), bounds AS (
+            SELECT MAX(bucket_start) AS max_bucket_start
+            FROM incident_counts_hourly
+        )
+        SELECT
+            f.feature_timestamp,
+            f.police_district,
+            f.incident_category,
+            f.hour_of_day,
+            f.day_of_week,
+            f.month_of_year,
+            COALESCE(f.incidents_last_1h, 0) AS incidents_last_1h,
+            COALESCE(f.incidents_last_3h, 0) AS incidents_last_3h,
+            COALESCE(f.incidents_last_6h, 0) AS incidents_last_6h,
+            COALESCE(f.incidents_last_24h, 0) AS incidents_last_24h,
+            COALESCE(f.incidents_last_7d, 0) AS incidents_last_7d,
+            COALESCE(f.open_active_ratio_24h, 0) AS open_active_ratio_24h,
+            COALESCE(f.filed_online_ratio_24h, 0) AS filed_online_ratio_24h,
+            COALESCE(f.avg_report_delay_minutes_24h, 0) AS avg_report_delay_minutes_24h,
+            COALESCE(n.total_incidents, 0) AS target_incidents_next_hour
+        FROM risk_features_hourly f
+        CROSS JOIN bounds b
+        LEFT JOIN next_counts n
+            ON n.bucket_start = f.feature_timestamp + INTERVAL '1 hour'
+           AND n.police_district = f.police_district
+           AND n.incident_category = f.incident_category
+        WHERE f.feature_timestamp >= NOW() - (%s::int * INTERVAL '1 day')
+          AND f.feature_timestamp < b.max_bucket_start
+          AND COALESCE(f.police_district, '') <> ''
+          AND COALESCE(f.incident_category, '') <> ''
+        ORDER BY f.feature_timestamp ASC, f.police_district ASC, f.incident_category ASC;
+        """,
+        (lookback_days,),
+    )
+
+
+def summarize_volume_ml_dataset(rows: list[dict[str, Any]], lookback_days: int) -> dict[str, Any]:
+    if not rows:
+        return {"lookback_days": lookback_days, "row_count": 0, "min_feature_timestamp": None, "max_feature_timestamp": None, "district_count": 0, "category_count": 0, "target_sum": 0, "target_avg": 0, "target_max": 0}
+
+    timestamps = [row["feature_timestamp"] for row in rows if row.get("feature_timestamp")]
+    targets = [float(row.get(ML_TARGET_COLUMN) or 0) for row in rows]
+    districts = {row.get("police_district") for row in rows if row.get("police_district")}
+    categories = {row.get("incident_category") for row in rows if row.get("incident_category")}
+
+    return {
+        "lookback_days": lookback_days,
+        "row_count": len(rows),
+        "min_feature_timestamp": min(timestamps).isoformat() if timestamps else None,
+        "max_feature_timestamp": max(timestamps).isoformat() if timestamps else None,
+        "district_count": len(districts),
+        "category_count": len(categories),
+        "target_sum": round(sum(targets), 4),
+        "target_avg": round(sum(targets) / len(targets), 4) if targets else 0,
+        "target_max": round(max(targets), 4) if targets else 0,
+    }
+
+
+def train_volume_forecast_model(rows: list[dict[str, Any]], test_size: float) -> dict[str, Any]:
+    try:
+        import joblib
+        import pandas as pd
+        from sklearn.compose import ColumnTransformer
+        from sklearn.ensemble import RandomForestRegressor
+        from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+        from sklearn.pipeline import Pipeline
+        from sklearn.preprocessing import OneHotEncoder
+    except ImportError as exc:
+        raise RuntimeError("Missing ML dependencies. Add scikit-learn, pandas, and joblib to requirements.txt.") from exc
+
+    if len(rows) < DEFAULT_ML_MIN_ROWS:
+        raise ValueError(f"Not enough rows to train. Required at least {DEFAULT_ML_MIN_ROWS}, got {len(rows)}.")
+
+    df = pd.DataFrame(rows).sort_values("feature_timestamp").reset_index(drop=True)
+
+    for column in ML_NUMERIC_FEATURES + [ML_TARGET_COLUMN]:
+        df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0)
+
+    for column in ML_CATEGORICAL_FEATURES:
+        df[column] = df[column].fillna("Unknown").astype(str)
+
+    feature_columns = ML_NUMERIC_FEATURES + ML_CATEGORICAL_FEATURES
+    X = df[feature_columns]
+    y = df[ML_TARGET_COLUMN]
+
+    split_index = int(len(df) * (1.0 - test_size))
+    split_index = max(1, min(split_index, len(df) - 1))
+
+    X_train = X.iloc[:split_index]
+    y_train = y.iloc[:split_index]
+    X_test = X.iloc[split_index:]
+    y_test = y.iloc[split_index:]
+
+    try:
+        encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
+    except TypeError:
+        encoder = OneHotEncoder(handle_unknown="ignore", sparse=False)
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("categorical", encoder, ML_CATEGORICAL_FEATURES),
+            ("numeric", "passthrough", ML_NUMERIC_FEATURES),
+        ]
+    )
+
+    model = Pipeline(
+        steps=[
+            ("preprocessor", preprocessor),
+            ("regressor", RandomForestRegressor(n_estimators=150, max_depth=14, min_samples_leaf=2, random_state=42, n_jobs=-1)),
+        ]
+    )
+
+    model.fit(X_train, y_train)
+    predictions = model.predict(X_test)
+
+    mae = float(mean_absolute_error(y_test, predictions))
+    mse = float(mean_squared_error(y_test, predictions))
+    rmse = math.sqrt(mse)
+    r2 = float(r2_score(y_test, predictions)) if len(y_test) > 1 else 0.0
+
+    actual_sum = float(y_test.sum())
+    predicted_sum = float(predictions.sum())
+    aggregate_error_pct = abs(predicted_sum - actual_sum) / max(actual_sum, 1.0) * 100.0
+
+    generated_at = datetime.utcnow().replace(microsecond=0)
+    MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+    model_path = MODEL_DIR / f"{VOLUME_MODEL_NAME}.joblib"
+    metrics_path = MODEL_DIR / f"{VOLUME_MODEL_NAME}_metrics.json"
+
+    joblib.dump(model, model_path)
+
+    metrics = {
+        "status": "ok",
+        "model_name": VOLUME_MODEL_NAME,
+        "model_type": "RandomForestRegressor",
+        "generated_at": generated_at.isoformat(),
+        "model_path": str(model_path),
+        "metrics_path": str(metrics_path),
+        "features": feature_columns,
+        "target": ML_TARGET_COLUMN,
+        "row_count": int(len(df)),
+        "train_rows": int(len(X_train)),
+        "test_rows": int(len(X_test)),
+        "test_size": test_size,
+        "time_range": {
+            "min_feature_timestamp": df["feature_timestamp"].min().isoformat(),
+            "max_feature_timestamp": df["feature_timestamp"].max().isoformat(),
+        },
+        "metrics": {
+            "mae": round(mae, 6),
+            "rmse": round(rmse, 6),
+            "r2": round(r2, 6),
+            "actual_sum_test": round(actual_sum, 6),
+            "predicted_sum_test": round(predicted_sum, 6),
+            "aggregate_error_pct": round(aggregate_error_pct, 6),
+        },
+    }
+
+    metrics_path.write_text(json.dumps(metrics, indent=2, default=str), encoding="utf-8")
+    return metrics
+
+
+def read_volume_model_metrics() -> dict[str, Any] | None:
+    metrics_path = MODEL_DIR / f"{VOLUME_MODEL_NAME}_metrics.json"
+    if not metrics_path.exists():
+        return None
+    return json.loads(metrics_path.read_text(encoding="utf-8"))
 
 
 @app.route("/")
@@ -739,6 +993,44 @@ def api_dashboard_forecast_training_summary():
             "max_bucket": row.get("max_bucket").isoformat() if row.get("max_bucket") else None,
         }
     )
+
+
+@app.route("/admin/ml/volume/dataset-summary", methods=["POST"])
+@require_admin_token
+def admin_ml_volume_dataset_summary():
+    payload = parse_admin_json_payload()
+    lookback_days = parse_positive_int(payload.get("lookback_days"), default=DEFAULT_ML_LOOKBACK_DAYS, min_value=7, max_value=3650)
+
+    rows = fetch_volume_ml_dataset(lookback_days=lookback_days)
+    summary = summarize_volume_ml_dataset(rows, lookback_days=lookback_days)
+
+    return jsonify({"status": "ok", "dataset": summary})
+
+
+@app.route("/admin/ml/volume/train", methods=["POST"])
+@require_admin_token
+def admin_ml_volume_train():
+    payload = parse_admin_json_payload()
+    lookback_days = parse_positive_int(payload.get("lookback_days"), default=DEFAULT_ML_LOOKBACK_DAYS, min_value=7, max_value=3650)
+    test_size = parse_float_range(payload.get("test_size"), default=DEFAULT_ML_TEST_SIZE, min_value=0.05, max_value=0.4)
+
+    try:
+        rows = fetch_volume_ml_dataset(lookback_days=lookback_days)
+        dataset_summary = summarize_volume_ml_dataset(rows, lookback_days=lookback_days)
+        training_result = train_volume_forecast_model(rows, test_size=test_size)
+        return jsonify({"status": "ok", "dataset": dataset_summary, "training": training_result})
+    except Exception as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 500
+
+
+@app.route("/admin/ml/volume/model-info", methods=["GET"])
+@require_admin_token
+def admin_ml_volume_model_info():
+    metrics = read_volume_model_metrics()
+    if not metrics:
+        return jsonify({"status": "not_found", "message": "No trained volume model metrics found yet.", "model_name": VOLUME_MODEL_NAME, "model_dir": str(MODEL_DIR)}), 404
+
+    return jsonify(metrics)
 
 
 if __name__ == "__main__":
