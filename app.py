@@ -715,7 +715,19 @@ def train_volume_forecast_model(rows: list[dict[str, Any]], test_size: float) ->
     event_probabilities = classifier.predict_proba(X_test)[:, 1]
     expected_count_if_event = regressor.predict(X_test)
     expected_count_if_event = [max(0.0, float(value)) for value in expected_count_if_event]
-    predictions = [float(prob) * float(count) for prob, count in zip(event_probabilities, expected_count_if_event)]
+
+    raw_predictions = [
+        max(0.0, float(probability)) * max(0.0, float(expected_count))
+        for probability, expected_count in zip(event_probabilities, expected_count_if_event)
+    ]
+
+    actual_sum = float(y_count_test.sum())
+    raw_predicted_sum = float(sum(raw_predictions))
+    calibration_factor = actual_sum / max(raw_predicted_sum, 1.0)
+    # Avoid pathological calibration if the test slice is unusual.
+    calibration_factor = max(0.001, min(float(calibration_factor), 10.0))
+
+    predictions = [float(value) * calibration_factor for value in raw_predictions]
 
     predicted_binary_default = [1 if prob >= 0.5 else 0 for prob in event_probabilities]
     predicted_binary_sensitive = [1 if prob >= 0.2 else 0 for prob in event_probabilities]
@@ -725,9 +737,9 @@ def train_volume_forecast_model(rows: list[dict[str, Any]], test_size: float) ->
     rmse = math.sqrt(mse)
     r2 = float(r2_score(y_count_test, predictions)) if len(y_count_test) > 1 else 0.0
 
-    actual_sum = float(y_count_test.sum())
     predicted_sum = float(sum(predictions))
     aggregate_error_pct = abs(predicted_sum - actual_sum) / max(actual_sum, 1.0) * 100.0
+    raw_aggregate_error_pct = abs(raw_predicted_sum - actual_sum) / max(actual_sum, 1.0) * 100.0
 
     try:
         roc_auc = float(roc_auc_score(y_binary_test, event_probabilities))
@@ -765,7 +777,8 @@ def train_volume_forecast_model(rows: list[dict[str, Any]], test_size: float) ->
         "numeric_features": ML_NUMERIC_FEATURES,
         "categorical_features": ML_CATEGORICAL_FEATURES,
         "target_column": ML_TARGET_COLUMN,
-        "prediction_formula": "event_probability * expected_count_if_event",
+        "calibration_factor": calibration_factor,
+        "prediction_formula": "event_probability * expected_count_if_event * calibration_factor",
     }
 
     generated_at = datetime.utcnow().replace(microsecond=0)
@@ -801,8 +814,11 @@ def train_volume_forecast_model(rows: list[dict[str, Any]], test_size: float) ->
             "rmse": round(rmse, 6),
             "r2": round(r2, 6),
             "actual_sum_test": round(actual_sum, 6),
+            "raw_predicted_sum_test": round(raw_predicted_sum, 6),
+            "raw_aggregate_error_pct": round(raw_aggregate_error_pct, 6),
             "predicted_sum_test": round(predicted_sum, 6),
             "aggregate_error_pct": round(aggregate_error_pct, 6),
+            "calibration_factor": round(calibration_factor, 8),
         },
         "classifier_metrics": classifier_metrics,
     }
@@ -916,8 +932,9 @@ def predict_volume_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         regressor = model["regressor"]
         event_probabilities = classifier.predict_proba(df[feature_columns])[:, 1]
         expected_count_if_event = regressor.predict(df[feature_columns])
+        calibration_factor = float(model.get("calibration_factor", 1.0) or 1.0)
         predicted_values = [
-            max(0.0, float(probability)) * max(0.0, float(expected_count))
+            max(0.0, float(probability)) * max(0.0, float(expected_count)) * calibration_factor
             for probability, expected_count in zip(event_probabilities, expected_count_if_event)
         ]
         model_type = "TwoStageZeroInflatedRandomForest"
@@ -944,6 +961,7 @@ def predict_volume_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "incident_category": row.get("incident_category"),
                 "event_probability_next_hour": round(probability_value, 4) if probability_value is not None else None,
                 "expected_incidents_if_event": round(count_if_event_value, 4) if count_if_event_value is not None else None,
+                "calibration_factor": round(float(model.get("calibration_factor", 1.0)), 8) if isinstance(model, dict) and model.get("model_type") == "TwoStageZeroInflatedRandomForest" else None,
                 "predicted_incidents_next_hour": round(predicted_value, 4),
             }
         )
