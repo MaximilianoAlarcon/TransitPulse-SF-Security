@@ -599,12 +599,29 @@ def load_volume_model() -> tuple[Any, str]:
 
 
 def train_volume_forecast_model(rows: list[dict[str, Any]], test_size: float) -> dict[str, Any]:
+    """
+    Train a two-stage zero-inflated volume model.
+
+    Stage 1: classifier estimates P(next-hour incidents > 0).
+    Stage 2: regressor estimates incident count only among positive-event rows.
+    Final prediction: probability_of_event * expected_count_if_event.
+    """
     try:
         import joblib
         import pandas as pd
         from sklearn.compose import ColumnTransformer
-        from sklearn.ensemble import RandomForestRegressor
-        from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+        from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+        from sklearn.metrics import (
+            accuracy_score,
+            average_precision_score,
+            f1_score,
+            mean_absolute_error,
+            mean_squared_error,
+            precision_score,
+            r2_score,
+            recall_score,
+            roc_auc_score,
+        )
         from sklearn.pipeline import Pipeline
         from sklearn.preprocessing import OneHotEncoder
     except ImportError as exc:
@@ -621,48 +638,135 @@ def train_volume_forecast_model(rows: list[dict[str, Any]], test_size: float) ->
     for column in ML_CATEGORICAL_FEATURES:
         df[column] = df[column].fillna("Unknown").astype(str)
 
+    df["target_has_incident_next_hour"] = (df[ML_TARGET_COLUMN] > 0).astype(int)
+
     feature_columns = ML_NUMERIC_FEATURES + ML_CATEGORICAL_FEATURES
     X = df[feature_columns]
-    y = df[ML_TARGET_COLUMN]
+    y_count = df[ML_TARGET_COLUMN]
+    y_binary = df["target_has_incident_next_hour"]
 
     split_index = int(len(df) * (1.0 - test_size))
     split_index = max(1, min(split_index, len(df) - 1))
 
     X_train = X.iloc[:split_index]
-    y_train = y.iloc[:split_index]
+    y_count_train = y_count.iloc[:split_index]
+    y_binary_train = y_binary.iloc[:split_index]
     X_test = X.iloc[split_index:]
-    y_test = y.iloc[split_index:]
+    y_count_test = y_count.iloc[split_index:]
+    y_binary_test = y_binary.iloc[split_index:]
+
+    positive_train_mask = y_count_train > 0
+    positive_train_rows = int(positive_train_mask.sum())
+    if positive_train_rows < max(20, int(DEFAULT_ML_MIN_ROWS * 0.05)):
+        raise ValueError(
+            "Not enough positive target rows to train the second-stage regressor. "
+            f"Positive train rows: {positive_train_rows}."
+        )
 
     try:
         encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
     except TypeError:
         encoder = OneHotEncoder(handle_unknown="ignore", sparse=False)
 
-    preprocessor = ColumnTransformer(
-        transformers=[
-            ("categorical", encoder, ML_CATEGORICAL_FEATURES),
-            ("numeric", "passthrough", ML_NUMERIC_FEATURES),
-        ]
-    )
+    def make_preprocessor() -> ColumnTransformer:
+        return ColumnTransformer(
+            transformers=[
+                ("categorical", encoder, ML_CATEGORICAL_FEATURES),
+                ("numeric", "passthrough", ML_NUMERIC_FEATURES),
+            ]
+        )
 
-    model = Pipeline(
+    classifier = Pipeline(
         steps=[
-            ("preprocessor", preprocessor),
-            ("regressor", RandomForestRegressor(n_estimators=150, max_depth=14, min_samples_leaf=2, random_state=42, n_jobs=-1)),
+            ("preprocessor", make_preprocessor()),
+            (
+                "classifier",
+                RandomForestClassifier(
+                    n_estimators=180,
+                    max_depth=14,
+                    min_samples_leaf=2,
+                    class_weight="balanced_subsample",
+                    random_state=42,
+                    n_jobs=-1,
+                ),
+            ),
         ]
     )
 
-    model.fit(X_train, y_train)
-    predictions = model.predict(X_test)
+    regressor = Pipeline(
+        steps=[
+            ("preprocessor", make_preprocessor()),
+            (
+                "regressor",
+                RandomForestRegressor(
+                    n_estimators=180,
+                    max_depth=14,
+                    min_samples_leaf=2,
+                    random_state=42,
+                    n_jobs=-1,
+                ),
+            ),
+        ]
+    )
 
-    mae = float(mean_absolute_error(y_test, predictions))
-    mse = float(mean_squared_error(y_test, predictions))
+    classifier.fit(X_train, y_binary_train)
+    regressor.fit(X_train.loc[positive_train_mask], y_count_train.loc[positive_train_mask])
+
+    event_probabilities = classifier.predict_proba(X_test)[:, 1]
+    expected_count_if_event = regressor.predict(X_test)
+    expected_count_if_event = [max(0.0, float(value)) for value in expected_count_if_event]
+    predictions = [float(prob) * float(count) for prob, count in zip(event_probabilities, expected_count_if_event)]
+
+    predicted_binary_default = [1 if prob >= 0.5 else 0 for prob in event_probabilities]
+    predicted_binary_sensitive = [1 if prob >= 0.2 else 0 for prob in event_probabilities]
+
+    mae = float(mean_absolute_error(y_count_test, predictions))
+    mse = float(mean_squared_error(y_count_test, predictions))
     rmse = math.sqrt(mse)
-    r2 = float(r2_score(y_test, predictions)) if len(y_test) > 1 else 0.0
+    r2 = float(r2_score(y_count_test, predictions)) if len(y_count_test) > 1 else 0.0
 
-    actual_sum = float(y_test.sum())
-    predicted_sum = float(predictions.sum())
+    actual_sum = float(y_count_test.sum())
+    predicted_sum = float(sum(predictions))
     aggregate_error_pct = abs(predicted_sum - actual_sum) / max(actual_sum, 1.0) * 100.0
+
+    try:
+        roc_auc = float(roc_auc_score(y_binary_test, event_probabilities))
+    except ValueError:
+        roc_auc = 0.0
+    try:
+        average_precision = float(average_precision_score(y_binary_test, event_probabilities))
+    except ValueError:
+        average_precision = 0.0
+
+    classifier_metrics = {
+        "positive_rate_train": round(float(y_binary_train.mean()), 6),
+        "positive_rate_test": round(float(y_binary_test.mean()), 6),
+        "roc_auc": round(roc_auc, 6),
+        "average_precision": round(average_precision, 6),
+        "threshold_0_50": {
+            "accuracy": round(float(accuracy_score(y_binary_test, predicted_binary_default)), 6),
+            "precision": round(float(precision_score(y_binary_test, predicted_binary_default, zero_division=0)), 6),
+            "recall": round(float(recall_score(y_binary_test, predicted_binary_default, zero_division=0)), 6),
+            "f1": round(float(f1_score(y_binary_test, predicted_binary_default, zero_division=0)), 6),
+        },
+        "threshold_0_20": {
+            "accuracy": round(float(accuracy_score(y_binary_test, predicted_binary_sensitive)), 6),
+            "precision": round(float(precision_score(y_binary_test, predicted_binary_sensitive, zero_division=0)), 6),
+            "recall": round(float(recall_score(y_binary_test, predicted_binary_sensitive, zero_division=0)), 6),
+            "f1": round(float(f1_score(y_binary_test, predicted_binary_sensitive, zero_division=0)), 6),
+        },
+    }
+
+    model_bundle = {
+        "model_type": "TwoStageZeroInflatedRandomForest",
+        "classifier": classifier,
+        "regressor": regressor,
+        "feature_columns": feature_columns,
+        "numeric_features": ML_NUMERIC_FEATURES,
+        "categorical_features": ML_CATEGORICAL_FEATURES,
+        "target_column": ML_TARGET_COLUMN,
+        "prediction_formula": "event_probability * expected_count_if_event",
+    }
 
     generated_at = datetime.utcnow().replace(microsecond=0)
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -670,20 +774,23 @@ def train_volume_forecast_model(rows: list[dict[str, Any]], test_size: float) ->
     model_path = MODEL_DIR / f"{VOLUME_MODEL_NAME}.joblib"
     metrics_path = MODEL_DIR / f"{VOLUME_MODEL_NAME}_metrics.json"
 
-    joblib.dump(model, model_path)
+    joblib.dump(model_bundle, model_path)
 
     metrics = {
         "status": "ok",
         "model_name": VOLUME_MODEL_NAME,
-        "model_type": "RandomForestRegressor",
+        "model_type": "TwoStageZeroInflatedRandomForest",
         "generated_at": generated_at.isoformat(),
         "model_path": str(model_path),
         "metrics_path": str(metrics_path),
         "features": feature_columns,
         "target": ML_TARGET_COLUMN,
+        "binary_target": "target_has_incident_next_hour",
         "row_count": int(len(df)),
         "train_rows": int(len(X_train)),
         "test_rows": int(len(X_test)),
+        "positive_train_rows": positive_train_rows,
+        "positive_test_rows": int(y_binary_test.sum()),
         "test_size": test_size,
         "time_range": {
             "min_feature_timestamp": df["feature_timestamp"].min().isoformat(),
@@ -697,6 +804,7 @@ def train_volume_forecast_model(rows: list[dict[str, Any]], test_size: float) ->
             "predicted_sum_test": round(predicted_sum, 6),
             "aggregate_error_pct": round(aggregate_error_pct, 6),
         },
+        "classifier_metrics": classifier_metrics,
     }
 
     metrics_path.write_text(json.dumps(metrics, indent=2, default=str), encoding="utf-8")
@@ -705,7 +813,7 @@ def train_volume_forecast_model(rows: list[dict[str, Any]], test_size: float) ->
     if MODEL_BUCKET_NAME and MODEL_BUCKET_ENDPOINT_URL:
         storage["s3"] = upload_volume_model_artifacts(model_path=model_path, metrics_path=metrics_path)
 
-    VOLUME_MODEL_CACHE["model"] = model
+    VOLUME_MODEL_CACHE["model"] = model_bundle
     VOLUME_MODEL_CACHE["source"] = str(model_path)
 
     metrics["storage"] = storage
@@ -776,10 +884,9 @@ def fetch_latest_volume_features(
 
 def predict_volume_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     try:
-        import joblib
         import pandas as pd
     except ImportError as exc:
-        raise RuntimeError("Missing ML dependencies. Add pandas and joblib to requirements.txt.") from exc
+        raise RuntimeError("Missing ML dependency. Add pandas to requirements.txt.") from exc
 
     if not rows:
         return {"predictions": [], "row_count": 0, "total_predicted_incidents_next_hour": 0.0, "model_source": None}
@@ -802,13 +909,32 @@ def predict_volume_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         df[column] = df[column].fillna("Unknown").astype(str)
 
     feature_columns = ML_NUMERIC_FEATURES + ML_CATEGORICAL_FEATURES
-    predicted_values = model.predict(df[feature_columns])
+
+    # Backward compatible: supports both older single regressor Pipeline and new two-stage bundle.
+    if isinstance(model, dict) and model.get("model_type") == "TwoStageZeroInflatedRandomForest":
+        classifier = model["classifier"]
+        regressor = model["regressor"]
+        event_probabilities = classifier.predict_proba(df[feature_columns])[:, 1]
+        expected_count_if_event = regressor.predict(df[feature_columns])
+        predicted_values = [
+            max(0.0, float(probability)) * max(0.0, float(expected_count))
+            for probability, expected_count in zip(event_probabilities, expected_count_if_event)
+        ]
+        model_type = "TwoStageZeroInflatedRandomForest"
+    else:
+        event_probabilities = [None] * len(df)
+        expected_count_if_event = [None] * len(df)
+        predicted_values = [max(0.0, float(value)) for value in model.predict(df[feature_columns])]
+        model_type = type(model).__name__
 
     predictions: list[dict[str, Any]] = []
-    for row, predicted in zip(rows, predicted_values):
+    for row, predicted, event_probability, count_if_event in zip(rows, predicted_values, event_probabilities, expected_count_if_event):
         predicted_value = max(0.0, float(predicted))
         feature_timestamp = row.get("feature_timestamp")
         forecast_for = feature_timestamp + timedelta(hours=1) if feature_timestamp else None
+
+        probability_value = None if event_probability is None else max(0.0, min(1.0, float(event_probability)))
+        count_if_event_value = None if count_if_event is None else max(0.0, float(count_if_event))
 
         predictions.append(
             {
@@ -816,6 +942,8 @@ def predict_volume_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "forecast_for": forecast_for.isoformat() if forecast_for else None,
                 "police_district": row.get("police_district"),
                 "incident_category": row.get("incident_category"),
+                "event_probability_next_hour": round(probability_value, 4) if probability_value is not None else None,
+                "expected_incidents_if_event": round(count_if_event_value, 4) if count_if_event_value is not None else None,
                 "predicted_incidents_next_hour": round(predicted_value, 4),
             }
         )
@@ -827,6 +955,7 @@ def predict_volume_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "predictions": predictions,
         "total_predicted_incidents_next_hour": round(sum(item["predicted_incidents_next_hour"] for item in predictions), 4),
         "model_source": model_source,
+        "model_runtime_type": model_type,
     }
 
 
