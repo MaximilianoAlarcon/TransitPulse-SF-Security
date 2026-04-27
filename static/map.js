@@ -556,34 +556,102 @@ function volumeRiskOpacity(level) {
   return 0.14;
 }
 
-function normalizedRiskRatio(score, maxScore) {
-  const numericScore = Math.max(0, Number(score || 0));
-  const numericMax = Math.max(0, Number(maxScore || 0));
+function clamp01(value) {
+  return Math.max(0, Math.min(1, Number(value || 0)));
+}
 
-  if (!Number.isFinite(numericScore) || !Number.isFinite(numericMax) || numericMax <= 0) {
+function percentile(sortedValues, p) {
+  if (!Array.isArray(sortedValues) || sortedValues.length === 0) return 0;
+
+  const safeP = clamp01(p);
+  const index = Math.round((sortedValues.length - 1) * safeP);
+  return Number(sortedValues[Math.max(0, Math.min(index, sortedValues.length - 1))] || 0);
+}
+
+function buildRiskVisualScale(features = []) {
+  const scores = features
+    .map((feature) => Number(feature?.properties?.risk_score_max || 0))
+    .filter((value) => Number.isFinite(value) && value >= 0)
+    .sort((a, b) => a - b);
+
+  if (scores.length === 0) {
+    return {
+      min: 0,
+      max: 0,
+      p10: 0,
+      p25: 0,
+      p50: 0,
+      p75: 0,
+      p90: 0,
+      mode: 'empty'
+    };
+  }
+
+  const min = scores[0];
+  const max = scores[scores.length - 1];
+
+  return {
+    min,
+    max,
+    p10: percentile(scores, 0.10),
+    p25: percentile(scores, 0.25),
+    p50: percentile(scores, 0.50),
+    p75: percentile(scores, 0.75),
+    p90: percentile(scores, 0.90),
+    mode: 'robust_percentile'
+  };
+}
+
+function normalizedRiskRatio(score, scale = {}) {
+  const numericScore = Math.max(0, Number(score || 0));
+  const min = Number(scale.min ?? 0);
+  const max = Number(scale.max ?? 0);
+  const p10 = Number(scale.p10 ?? min);
+  const p90 = Number(scale.p90 ?? max);
+
+  if (!Number.isFinite(numericScore) || !Number.isFinite(min) || !Number.isFinite(max) || max <= min) {
     return 0;
   }
 
-  return Math.max(0, Math.min(1, numericScore / numericMax));
+  // Robust normalization: ignores the lowest and highest tails so one outlier
+  // does not flatten the rest of the map visually.
+  if (Number.isFinite(p10) && Number.isFinite(p90) && p90 > p10) {
+    return clamp01((numericScore - p10) / (p90 - p10));
+  }
+
+  return clamp01((numericScore - min) / (max - min));
 }
 
-function riskProjectionColor(score, maxScore) {
-  const ratio = normalizedRiskRatio(score, maxScore);
+function riskProjectionColor(score, scale = {}) {
+  const ratio = normalizedRiskRatio(score, scale);
 
-  if (ratio >= 0.85) return '#7f1d1d';
-  if (ratio >= 0.65) return '#dc2626';
-  if (ratio >= 0.45) return '#f97316';
-  if (ratio >= 0.25) return '#facc15';
+  if (ratio >= 0.86) return '#7f1d1d';
+  if (ratio >= 0.68) return '#dc2626';
+  if (ratio >= 0.48) return '#f97316';
+  if (ratio >= 0.26) return '#facc15';
   return '#84cc16';
 }
 
-function riskProjectionOpacity(score, maxScore) {
-  const ratio = normalizedRiskRatio(score, maxScore);
-  return Math.max(0.24, Math.min(0.72, 0.24 + ratio * 0.44));
+function riskProjectionOpacity(score, scale = {}) {
+  const ratio = normalizedRiskRatio(score, scale);
+  return Math.max(0.28, Math.min(0.76, 0.28 + ratio * 0.44));
 }
 
-function riskProjectionPopupHtml(properties = {}) {
+function riskVisualBucketLabel(score, scale = {}) {
+  const ratio = normalizedRiskRatio(score, scale);
+
+  if (ratio >= 0.86) return 'Highest visual band';
+  if (ratio >= 0.68) return 'High visual band';
+  if (ratio >= 0.48) return 'Elevated visual band';
+  if (ratio >= 0.26) return 'Moderate visual band';
+  return 'Lower visual band';
+}
+
+function riskProjectionPopupHtml(properties = {}, visualScale = {}) {
   const categories = Array.isArray(properties.top_risk_categories) ? properties.top_risk_categories : [];
+  const score = Number(properties.risk_score_max || 0);
+  const visualBand = riskVisualBucketLabel(score, visualScale);
+
   const topCategoriesHtml = categories.length > 0
     ? categories.map((item) => {
         return `<li>#${item.rank || '-'} ${item.incident_category}: ${formatNumber(item.risk_score, 4)}</li>`;
@@ -594,6 +662,7 @@ function riskProjectionPopupHtml(properties = {}) {
     <div class="popup-card">
       <strong>${properties.police_district || 'Unknown district'}</strong><br>
       <span>District risk: ${(properties.risk_level || 'Low').toUpperCase()}</span><br>
+      <span>Visual band: ${visualBand}</span><br>
       <span>Max risk score: ${formatNumber(properties.risk_score_max || 0, 4)}</span><br>
       <span>Avg risk score: ${formatNumber(properties.risk_score_avg || 0, 4)}</span><br>
       <hr>
@@ -924,6 +993,7 @@ function renderRiskProjectionSummary(payload) {
   const rows = formatNumber(summary.prediction_rows || 0, 0);
 
   const thresholds = payload?.risk_score_thresholds || {};
+  const visualScale = buildRiskVisualScale(Array.isArray(payload?.features) ? payload.features : []);
   const statusEl = document.getElementById('risk-projection-status');
   const currentStatus = statusEl ? statusEl.textContent : 'Loaded.';
 
@@ -941,12 +1011,18 @@ function renderRiskProjectionSummary(payload) {
       <span>${formatProjectionTimestampLabel(payload?.filters?.target_timestamp)}</span>
     </div>
     <div class="roadmap-item">
+      <strong>Visual scale</strong>
+      <span>P10 ${formatNumber(visualScale.p10 || 0, 4)} · P50 ${formatNumber(visualScale.p50 || 0, 4)} · P90 ${formatNumber(visualScale.p90 || 0, 4)}</span>
+    </div>
+    <div class="roadmap-item">
       <strong>Risk thresholds</strong>
       <span>Medium ${formatNumber(thresholds.medium || 0, 4)} · High ${formatNumber(thresholds.high || 0, 4)} · Very High ${formatNumber(thresholds.very_high || 0, 4)}</span>
     </div>
     <div class="risk-legend">
-      <span class="risk-legend-item"><span class="risk-legend-swatch" style="background:#7f1d1d"></span>Highest relative risk</span>
+      <span class="risk-legend-item"><span class="risk-legend-swatch" style="background:#7f1d1d"></span>Highest visual band</span>
+      <span class="risk-legend-item"><span class="risk-legend-swatch" style="background:#dc2626"></span>High</span>
       <span class="risk-legend-item"><span class="risk-legend-swatch" style="background:#f97316"></span>Elevated</span>
+      <span class="risk-legend-item"><span class="risk-legend-swatch" style="background:#facc15"></span>Moderate</span>
       <span class="risk-legend-item"><span class="risk-legend-swatch" style="background:#84cc16"></span>Lower</span>
     </div>
 
@@ -976,6 +1052,7 @@ function renderRiskForecastPolygons(payload) {
   const featureCollection = buildCleanFeatureCollection(payload);
   const features = featureCollection.features;
   const maxRiskScore = Number(payload?.summary?.max_risk_score || payload?.max_risk_score || 0);
+  const visualScale = buildRiskVisualScale(features);
 
   appState.layers.riskForecast = L.geoJSON(featureCollection, {
     renderer: L.svg(),
@@ -985,8 +1062,8 @@ function renderRiskForecastPolygons(payload) {
         color: 'rgba(255,255,255,0.78)',
         weight: 1.15,
         opacity: 0.95,
-        fillColor: riskProjectionColor(score, maxRiskScore),
-        fillOpacity: riskProjectionOpacity(score, maxRiskScore),
+        fillColor: riskProjectionColor(score, visualScale),
+        fillOpacity: riskProjectionOpacity(score, visualScale),
         lineJoin: 'round',
         lineCap: 'round'
       };
@@ -996,7 +1073,7 @@ function renderRiskForecastPolygons(payload) {
       const score = formatNumber(properties.risk_score_max || 0, 4);
       const label = `${properties.police_district || 'District'} · ${properties.risk_level || 'Risk'} · ${score}`;
 
-      layer.bindPopup(riskProjectionPopupHtml(properties));
+      layer.bindPopup(riskProjectionPopupHtml(properties, visualScale));
       layer.bindTooltip(label, {
         sticky: true,
         direction: 'top',
@@ -1008,7 +1085,7 @@ function renderRiskForecastPolygons(payload) {
         layer.setStyle({
           weight: 2.2,
           color: 'rgba(255,255,255,0.96)',
-          fillOpacity: Math.min(riskProjectionOpacity(layerScore, maxRiskScore) + 0.12, 0.82)
+          fillOpacity: Math.min(riskProjectionOpacity(layerScore, visualScale) + 0.12, 0.86)
         });
         layer.bringToFront();
       });
@@ -1030,7 +1107,7 @@ function renderRiskForecastPolygons(payload) {
 
   const caption = document.getElementById('map-caption');
   if (caption) {
-    caption.textContent = `ML risk projections · max score ${formatNumber(maxRiskScore, 4)} · ${formatNumber(features.length, 0)} districts`;
+    caption.textContent = `ML risk projections · robust visual scale · max score ${formatNumber(maxRiskScore, 4)} · ${formatNumber(features.length, 0)} districts`;
   }
 
   renderRiskProjectionSummary(payload);
