@@ -21,12 +21,18 @@ from zoneinfo import ZoneInfo
 from ml_utils import (
     MODEL_BUCKET_NAME,
     MODEL_DIR,
+    RISK_CLASSIFIER_MODEL_NAME,
     VOLUME_MODEL_NAME,
+    build_risk_forecast_geojson,
     build_volume_forecast_geojson,
     fetch_latest_volume_features,
     get_model_artifact_keys,
+    get_risk_model_artifact_keys,
+    get_risk_model_path,
     get_volume_model_path,
+    predict_risk_from_rows,
     predict_volume_from_rows,
+    read_risk_model_metrics,
     read_volume_model_metrics,
 )
 
@@ -1142,6 +1148,205 @@ def api_dashboard_ml_volume_polygons():
     except Exception as exc:
         return jsonify({"status": "error", "message": str(exc)}), 500
 
+
+
+@app.route("/admin/ml/risk/model-info", methods=["GET"])
+@require_admin_token
+def admin_ml_risk_model_info():
+    metrics = read_risk_model_metrics()
+    if not metrics:
+        return jsonify({
+            "status": "not_found",
+            "message": "No trained risk classifier model metrics found yet.",
+            "model_name": RISK_CLASSIFIER_MODEL_NAME,
+            "model_dir": str(MODEL_DIR),
+            "bucket": MODEL_BUCKET_NAME,
+            "model_key": get_risk_model_artifact_keys()["model"],
+        }), 404
+
+    return jsonify(metrics)
+
+
+@app.route("/admin/ml/risk/predict", methods=["POST"])
+@require_admin_token
+def admin_ml_risk_predict():
+    payload = parse_admin_json_payload()
+    limit = parse_positive_int(payload.get("limit"), default=200, min_value=1, max_value=5000)
+    district = (payload.get("district") or "").strip() or None
+    category = (payload.get("category") or "").strip() or None
+
+    raw_target_timestamp = (payload.get("target_timestamp") or "latest").strip()
+    try:
+        target_timestamp = parse_sf_target_timestamp(raw_target_timestamp)
+    except ValueError:
+        return jsonify({
+            "status": "error",
+            "message": (
+                "Invalid target_timestamp. Use 'latest', a San Francisco local timestamp "
+                "like 2026-04-24T22:00:00, or an ISO timestamp with timezone like "
+                "2026-04-25T05:00:00Z."
+            ),
+        }), 400
+
+    try:
+        rows = fetch_latest_volume_features(
+            limit=limit,
+            target_timestamp=None,
+            district=district,
+            category=category,
+        )
+        rows = apply_projection_timestamp_to_rows(rows, target_timestamp)
+
+        result = predict_risk_from_rows(rows)
+        metrics = read_risk_model_metrics()
+        model_path = get_risk_model_path()
+
+        return jsonify(
+            {
+                "status": "ok",
+                "model_name": RISK_CLASSIFIER_MODEL_NAME,
+                "model_path": str(model_path),
+                "model_source": result.get("model_source"),
+                "model_generated_at": metrics.get("generated_at") if metrics else None,
+                "filters": {
+                    "target_timestamp": target_timestamp.isoformat() if target_timestamp else "latest",
+                    "target_timezone": "America/Los_Angeles",
+                    "district": district or "all",
+                    "category": category or "all",
+                    "limit": limit,
+                },
+                **result,
+            }
+        )
+    except Exception as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 500
+
+
+@app.route("/api/dashboard/ml-risk-predictions", methods=["GET"])
+def api_dashboard_ml_risk_predictions():
+    category = (request.args.get("category") or "all").strip()
+    district = (request.args.get("district") or "all").strip()
+
+    category_filter = None if category.lower() == "all" else category
+    district_filter = None if district.lower() == "all" else district
+
+    raw_target_timestamp = (request.args.get("target_timestamp") or "latest").strip()
+
+    try:
+        target_timestamp = parse_sf_target_timestamp(raw_target_timestamp)
+    except ValueError:
+        return jsonify(
+            {
+                "status": "error",
+                "message": (
+                    "Invalid target_timestamp. Use 'latest', a San Francisco local timestamp "
+                    "like 2026-04-26T13:00:00, or an ISO timestamp with timezone like "
+                    "2026-04-26T20:00:00Z."
+                ),
+            }
+        ), 400
+
+    try:
+        rows = fetch_latest_volume_features(
+            limit=None,
+            target_timestamp=None,
+            district=district_filter,
+            category=category_filter,
+        )
+
+        rows = apply_projection_timestamp_to_rows(rows, target_timestamp)
+
+        prediction_result = predict_risk_from_rows(rows)
+
+        return jsonify(
+            {
+                "status": "ok",
+                "model_name": RISK_CLASSIFIER_MODEL_NAME,
+                "model_runtime_type": prediction_result.get("model_runtime_type"),
+                "model_source": prediction_result.get("model_source"),
+                "filters": {
+                    "target_timestamp": target_timestamp.isoformat() if target_timestamp else "latest",
+                    "target_timezone": "America/Los_Angeles",
+                    "district": district_filter or "all",
+                    "category": category_filter or "all",
+                },
+                "summary": {
+                    "source_rows": len(rows),
+                    "prediction_rows": prediction_result.get("row_count", 0),
+                },
+                "predictions": prediction_result.get("predictions", []),
+            }
+        )
+
+    except Exception as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 500
+
+
+@app.route("/api/dashboard/ml-risk-polygons", methods=["GET"])
+def api_dashboard_ml_risk_polygons():
+    category = (request.args.get("category") or "all").strip()
+    district = (request.args.get("district") or "all").strip()
+
+    category_filter = None if category.lower() == "all" else category
+    district_filter = None if district.lower() == "all" else district
+
+    raw_target_timestamp = (request.args.get("target_timestamp") or "latest").strip()
+
+    try:
+        target_timestamp = parse_sf_target_timestamp(raw_target_timestamp)
+    except ValueError:
+        return jsonify(
+            {
+                "status": "error",
+                "message": (
+                    "Invalid target_timestamp. Use 'latest', a San Francisco local timestamp "
+                    "like 2026-04-26T13:00:00, or an ISO timestamp with timezone like "
+                    "2026-04-26T20:00:00Z."
+                ),
+            }
+        ), 400
+
+    try:
+        rows = fetch_latest_volume_features(
+            limit=None,
+            target_timestamp=None,
+            district=district_filter,
+            category=category_filter,
+        )
+
+        rows = apply_projection_timestamp_to_rows(rows, target_timestamp)
+
+        prediction_result = predict_risk_from_rows(rows)
+        forecast_geojson = build_risk_forecast_geojson(
+            prediction_result.get("predictions", [])
+        )
+
+        return jsonify(
+            {
+                "status": "ok",
+                "model_name": RISK_CLASSIFIER_MODEL_NAME,
+                "model_runtime_type": prediction_result.get("model_runtime_type"),
+                "model_source": prediction_result.get("model_source"),
+                "filters": {
+                    "target_timestamp": target_timestamp.isoformat() if target_timestamp else "latest",
+                    "target_timezone": "America/Los_Angeles",
+                    "district": district_filter or "all",
+                    "category": category_filter or "all",
+                },
+                "summary": {
+                    "source_rows": len(rows),
+                    "prediction_rows": prediction_result.get("row_count", 0),
+                    "mapped_districts": forecast_geojson["mapped_districts"],
+                    "max_risk_score": forecast_geojson["max_risk_score"],
+                    "avg_risk_score": forecast_geojson["avg_risk_score"],
+                },
+                "type": forecast_geojson["type"],
+                "features": forecast_geojson["features"],
+            }
+        )
+
+    except Exception as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 500
 
 
 if __name__ == "__main__":

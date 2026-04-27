@@ -2,9 +2,10 @@
 Weekly ML training pipeline runner for CI San Francisco.
 
 This runner executes a configurable list of training scripts in sequence.
-Both files can live in the same directory:
+All files can live in the same directory:
 - run_pipeline.py
 - ml_model_volume.py
+- ml_model_risk_classifier.py
 
 Usage:
     python run_pipeline.py
@@ -30,7 +31,7 @@ CURRENT_DIR = Path(__file__).resolve().parent
 DEFAULT_TIMEOUT_SECONDS = 7200
 MAX_TIMEOUT_SECONDS = 10800
 
-# Add future model-training scripts here.
+# Add model-training scripts here.
 # Each step runs sequentially. If one fails, the pipeline stops.
 TRAINING_STEPS: list[dict[str, Any]] = [
     {
@@ -41,14 +42,14 @@ TRAINING_STEPS: list[dict[str, Any]] = [
         # Optional per-step timeout. If None, uses WEEKLY_TRAINING_TIMEOUT_SECONDS.
         "timeout_seconds": None,
     },
-    # Example future step:
-    # {
-    #     "name": "ml_model_hotspots",
-    #     "script": "ml_model_hotspots.py",
-    #     "enabled": False,
-    #     "model_name": "hotspot_model_v1",
-    #     "timeout_seconds": 7200,
-    # },
+    {
+        "name": "ml_model_risk_classifier",
+        "script": "ml_model_risk_classifier.py",
+        "enabled": True,
+        "model_name": "risk_classifier_random_forest_v1",
+        # Optional per-step timeout. If None, uses WEEKLY_TRAINING_TIMEOUT_SECONDS.
+        "timeout_seconds": None,
+    },
 ]
 
 

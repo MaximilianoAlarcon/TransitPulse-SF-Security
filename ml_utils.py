@@ -502,3 +502,364 @@ def build_volume_forecast_geojson(
             4,
         ),
     }
+
+
+# -----------------------
+# Risk classifier utilities
+# -----------------------
+
+RISK_CLASSIFIER_MODEL_NAME = os.environ.get(
+    "RISK_CLASSIFIER_MODEL_NAME",
+    "risk_classifier_random_forest_v1",
+)
+
+RISK_MODEL_CACHE: dict[str, Any] = {
+    "model": None,
+    "source": None,
+}
+
+RISK_NUMERIC_FEATURES = [
+    "hour_of_day",
+    "month_of_year",
+    "incidents_last_1h",
+    "incidents_last_3h",
+    "incidents_last_6h",
+    "incidents_last_24h",
+    "incidents_last_7d",
+    "open_active_ratio_24h",
+    "filed_online_ratio_24h",
+    "avg_report_delay_minutes_24h",
+]
+
+RISK_CATEGORICAL_FEATURES = [
+    "police_district",
+    "incident_category",
+    "day_of_week",
+]
+
+RISK_LEVEL_ORDER = ["Low", "Medium", "High", "Very High"]
+
+
+def get_risk_model_path() -> Path:
+    return MODEL_DIR / f"{RISK_CLASSIFIER_MODEL_NAME}.joblib"
+
+
+def get_risk_model_artifact_keys() -> dict[str, str]:
+    return {
+        "model": f"{MODEL_S3_PREFIX.rstrip('/')}/{RISK_CLASSIFIER_MODEL_NAME}.joblib",
+        "metrics": f"{MODEL_S3_PREFIX.rstrip('/')}/{RISK_CLASSIFIER_MODEL_NAME}_metrics.json",
+    }
+
+
+def read_risk_model_metrics_from_bucket() -> dict[str, Any] | None:
+    keys = get_risk_model_artifact_keys()
+
+    try:
+        raw = download_bytes_from_model_bucket(keys["metrics"])
+    except Exception:
+        return None
+
+    return json.loads(raw.decode("utf-8"))
+
+
+def read_risk_model_metrics() -> dict[str, Any] | None:
+    metrics_path = MODEL_DIR / f"{RISK_CLASSIFIER_MODEL_NAME}_metrics.json"
+
+    if metrics_path.exists():
+        return json.loads(metrics_path.read_text(encoding="utf-8"))
+
+    if MODEL_BUCKET_NAME and MODEL_BUCKET_ENDPOINT_URL:
+        return read_risk_model_metrics_from_bucket()
+
+    return None
+
+
+def load_risk_model_from_bucket() -> Any:
+    try:
+        import joblib
+    except ImportError as exc:
+        raise RuntimeError("Missing ML dependency. Add joblib to requirements.txt.") from exc
+
+    keys = get_risk_model_artifact_keys()
+    raw = download_bytes_from_model_bucket(keys["model"])
+    return joblib.load(io.BytesIO(raw))
+
+
+def load_risk_model() -> tuple[Any, str]:
+    cached_model = RISK_MODEL_CACHE.get("model")
+    cached_source = RISK_MODEL_CACHE.get("source")
+
+    if cached_model is not None:
+        return cached_model, str(cached_source or "memory_cache")
+
+    try:
+        import joblib
+    except ImportError as exc:
+        raise RuntimeError("Missing ML dependency. Add joblib to requirements.txt.") from exc
+
+    model_path = get_risk_model_path()
+
+    if model_path.exists():
+        model = joblib.load(model_path)
+        RISK_MODEL_CACHE["model"] = model
+        RISK_MODEL_CACHE["source"] = str(model_path)
+        return model, str(model_path)
+
+    model = load_risk_model_from_bucket()
+    RISK_MODEL_CACHE["model"] = model
+    RISK_MODEL_CACHE["source"] = f"s3://{MODEL_BUCKET_NAME}/{get_risk_model_artifact_keys()['model']}"
+
+    try:
+        MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        joblib.dump(model, model_path)
+    except Exception:
+        pass
+
+    return model, str(RISK_MODEL_CACHE["source"])
+
+
+def risk_level_from_score(score: float) -> str:
+    if score >= 0.75:
+        return "Very High"
+    if score >= 0.55:
+        return "High"
+    if score >= 0.30:
+        return "Medium"
+    return "Low"
+
+
+def risk_level_sort_value(level: Any) -> int:
+    normalized = str(level or "").strip().title()
+    if normalized == "Very High":
+        return 4
+    if normalized == "High":
+        return 3
+    if normalized == "Medium":
+        return 2
+    if normalized == "Low":
+        return 1
+    return 0
+
+
+def predict_risk_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise RuntimeError("Missing ML dependency. Add pandas to requirements.txt.") from exc
+
+    if not rows:
+        return {
+            "predictions": [],
+            "row_count": 0,
+            "model_source": None,
+            "model_runtime_type": None,
+        }
+
+    try:
+        model_bundle, model_source = load_risk_model()
+    except Exception as exc:
+        raise FileNotFoundError(
+            "Trained risk classifier model could not be loaded from local filesystem or Railway Bucket. "
+            f"Details: {exc}"
+        ) from exc
+
+    df = pd.DataFrame(rows)
+
+    numeric_features = list(model_bundle.get("numeric_features") or RISK_NUMERIC_FEATURES)
+    categorical_features = list(model_bundle.get("categorical_features") or RISK_CATEGORICAL_FEATURES)
+    feature_columns = list(model_bundle.get("feature_columns") or (numeric_features + categorical_features))
+
+    for column in numeric_features:
+        df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0)
+
+    for column in categorical_features:
+        df[column] = df[column].fillna("Unknown").astype(str)
+
+    missing_columns = [column for column in feature_columns if column not in df.columns]
+    if missing_columns:
+        raise ValueError(f"Missing required risk model feature columns: {missing_columns}")
+
+    classifier = model_bundle.get("classifier") if isinstance(model_bundle, dict) else None
+    regressor = model_bundle.get("regressor") if isinstance(model_bundle, dict) else None
+
+    if classifier is None or regressor is None:
+        raise ValueError("Invalid risk model artifact. Expected classifier and regressor in model bundle.")
+
+    X = df[feature_columns]
+    predicted_level_ids = classifier.predict(X)
+    predicted_scores = regressor.predict(X)
+
+    level_order = list(model_bundle.get("risk_level_order") or RISK_LEVEL_ORDER)
+    int_to_level_raw = model_bundle.get("int_to_risk_level") or {}
+    int_to_level = {int(key): value for key, value in int_to_level_raw.items()} if isinstance(int_to_level_raw, dict) else {}
+
+    probabilities = None
+    try:
+        probabilities = classifier.predict_proba(X)
+        classifier_classes = [int(value) for value in classifier.classes_]
+    except Exception:
+        probabilities = None
+        classifier_classes = []
+
+    predictions: list[dict[str, Any]] = []
+
+    for index, (row, level_id, score) in enumerate(zip(rows, predicted_level_ids, predicted_scores)):
+        score_value = max(0.0, min(1.0, float(score)))
+        level_id_int = int(level_id)
+        level = int_to_level.get(level_id_int) or (
+            level_order[level_id_int] if 0 <= level_id_int < len(level_order) else risk_level_from_score(score_value)
+        )
+
+        feature_timestamp = row.get("feature_timestamp")
+        forecast_for = feature_timestamp + timedelta(hours=1) if feature_timestamp else None
+
+        level_probability = None
+        if probabilities is not None and level_id_int in classifier_classes:
+            class_index = classifier_classes.index(level_id_int)
+            level_probability = float(probabilities[index][class_index])
+
+        predictions.append(
+            {
+                "feature_timestamp": feature_timestamp.isoformat() if feature_timestamp else None,
+                "forecast_for": forecast_for.isoformat() if forecast_for else None,
+                "police_district": row.get("police_district"),
+                "incident_category": row.get("incident_category"),
+                "risk_score": round(score_value, 4),
+                "risk_level": str(level),
+                "risk_level_probability": round(level_probability, 4) if level_probability is not None else None,
+            }
+        )
+
+    predictions.sort(
+        key=lambda item: (
+            float(item.get("risk_score") or 0),
+            risk_level_sort_value(item.get("risk_level")),
+        ),
+        reverse=True,
+    )
+
+    return {
+        "row_count": len(predictions),
+        "predictions": predictions,
+        "model_source": model_source,
+        "model_runtime_type": model_bundle.get("model_type") if isinstance(model_bundle, dict) else type(model_bundle).__name__,
+    }
+
+
+def classify_district_risk_level(score: float) -> str:
+    return risk_level_from_score(score)
+
+
+def build_risk_forecast_geojson(
+    predictions: list[dict[str, Any]],
+) -> dict[str, Any]:
+    by_district: dict[str, dict[str, Any]] = {}
+
+    for item in predictions:
+        district_key = normalize_district_name(item.get("police_district"))
+
+        if district_key not in VALID_MAP_DISTRICTS:
+            continue
+
+        entry = by_district.setdefault(
+            district_key,
+            {
+                "police_district": title_district_name(district_key),
+                "risk_score_sum": 0.0,
+                "risk_score_max": 0.0,
+                "risk_level_max": "Low",
+                "risk_level_probability_max": 0.0,
+                "categories": [],
+            },
+        )
+
+        risk_score = float(item.get("risk_score") or 0)
+        risk_level = item.get("risk_level") or classify_district_risk_level(risk_score)
+        risk_level_probability = float(item.get("risk_level_probability") or 0)
+
+        entry["risk_score_sum"] += risk_score
+        entry["risk_score_max"] = max(entry["risk_score_max"], risk_score)
+        entry["risk_level_probability_max"] = max(entry["risk_level_probability_max"], risk_level_probability)
+
+        if risk_level_sort_value(risk_level) > risk_level_sort_value(entry["risk_level_max"]):
+            entry["risk_level_max"] = str(risk_level)
+
+        entry["categories"].append(
+            {
+                "incident_category": item.get("incident_category") or "Unknown",
+                "risk_score": round(risk_score, 4),
+                "risk_level": str(risk_level),
+                "risk_level_probability": round(risk_level_probability, 4),
+            }
+        )
+
+    for entry in by_district.values():
+        category_count = max(1, len(entry["categories"]))
+        entry["risk_score_avg"] = round(entry["risk_score_sum"] / category_count, 4)
+        entry["risk_score_max"] = round(entry["risk_score_max"], 4)
+        entry["risk_level_probability_max"] = round(entry["risk_level_probability_max"], 4)
+        entry["risk_level"] = classify_district_risk_level(entry["risk_score_max"])
+        entry["categories"] = sorted(
+            entry["categories"],
+            key=lambda row: (row["risk_score"], risk_level_sort_value(row["risk_level"])),
+            reverse=True,
+        )[:5]
+
+    source_geojson = load_police_districts_geojson()
+    output_features = []
+
+    for feature in source_geojson.get("features", []):
+        properties = dict(feature.get("properties") or {})
+        district_key = get_geojson_district_name(properties)
+
+        if district_key not in VALID_MAP_DISTRICTS:
+            continue
+
+        forecast = by_district.get(
+            district_key,
+            {
+                "police_district": title_district_name(district_key),
+                "risk_score_avg": 0.0,
+                "risk_score_max": 0.0,
+                "risk_level": "Low",
+                "risk_level_max": "Low",
+                "risk_level_probability_max": 0.0,
+                "categories": [],
+            },
+        )
+
+        properties.update(
+            {
+                "police_district": title_district_name(district_key),
+                "district_key": district_key,
+                "risk_score_avg": forecast["risk_score_avg"],
+                "risk_score_max": forecast["risk_score_max"],
+                "risk_level": forecast["risk_level"],
+                "risk_level_max": forecast.get("risk_level_max", forecast["risk_level"]),
+                "risk_level_probability_max": forecast["risk_level_probability_max"],
+                "top_risk_categories": forecast["categories"],
+            }
+        )
+
+        output_features.append(
+            {
+                "type": "Feature",
+                "geometry": feature.get("geometry"),
+                "properties": properties,
+            }
+        )
+
+    return {
+        "type": "FeatureCollection",
+        "features": output_features,
+        "mapped_districts": len(by_district),
+        "max_risk_score": round(
+            max((item["risk_score_max"] for item in by_district.values()), default=0.0),
+            4,
+        ),
+        "avg_risk_score": round(
+            sum(item["risk_score_avg"] for item in by_district.values()) / max(1, len(by_district)),
+            4,
+        ),
+    }
+
