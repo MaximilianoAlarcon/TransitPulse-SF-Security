@@ -10,7 +10,6 @@ from psycopg2.extras import RealDictCursor
 from utils import get_db_connection
 
 
-
 BASE_DIR = Path(__file__).resolve().parent
 
 MODEL_DIR = Path(os.environ.get("MODEL_DIR", BASE_DIR / "models"))
@@ -969,7 +968,6 @@ def build_risk_forecast_geojson(
                 "police_district": title_district_name(district_key),
                 "risk_score_sum": 0.0,
                 "risk_score_max": 0.0,
-                "risk_level_max": "Low",
                 "risk_level_probability_max": 0.0,
                 "categories": [],
             },
@@ -983,14 +981,10 @@ def build_risk_forecast_geojson(
         entry["risk_score_max"] = max(entry["risk_score_max"], risk_score)
         entry["risk_level_probability_max"] = max(entry["risk_level_probability_max"], risk_level_probability)
 
-        if risk_level_sort_value(risk_level) > risk_level_sort_value(entry["risk_level_max"]):
-            entry["risk_level_max"] = str(risk_level)
-
         entry["categories"].append(
             {
                 "incident_category": item.get("incident_category") or "Unknown",
                 "risk_score": round(risk_score, 4),
-                "risk_level": str(risk_level),
                 "risk_level_probability": round(risk_level_probability, 4),
             }
         )
@@ -1009,9 +1003,12 @@ def build_risk_forecast_geojson(
         entry["risk_level"] = risk_level_from_score(entry["risk_score_max"], district_score_thresholds)
         entry["categories"] = sorted(
             entry["categories"],
-            key=lambda row: (row["risk_score"], risk_level_sort_value(row["risk_level"])),
+            key=lambda row: row["risk_score"],
             reverse=True,
         )[:5]
+
+        for index, category in enumerate(entry["categories"], start=1):
+            category["rank"] = index
 
     source_geojson = load_police_districts_geojson()
     output_features = []
@@ -1030,7 +1027,6 @@ def build_risk_forecast_geojson(
                 "risk_score_avg": 0.0,
                 "risk_score_max": 0.0,
                 "risk_level": "Low",
-                "risk_level_max": "Low",
                 "risk_level_probability_max": 0.0,
                 "categories": [],
             },
@@ -1043,7 +1039,6 @@ def build_risk_forecast_geojson(
                 "risk_score_avg": forecast["risk_score_avg"],
                 "risk_score_max": forecast["risk_score_max"],
                 "risk_level": forecast["risk_level"],
-                "risk_level_max": forecast.get("risk_level_max", forecast["risk_level"]),
                 "risk_level_probability_max": forecast["risk_level_probability_max"],
                 "top_risk_categories": forecast["categories"],
             }
@@ -1074,5 +1069,7 @@ def build_risk_forecast_geojson(
             for key, value in district_score_thresholds.items()
         },
         "level_strategy": "dynamic_district_score_percentiles",
+        "level_source": "district_risk_score_max",
+        "category_level_policy": "top_risk_categories are ranked by risk_score only; they do not define district risk_level",
     }
 
