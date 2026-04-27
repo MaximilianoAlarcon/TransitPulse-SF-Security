@@ -9,6 +9,8 @@ from psycopg2.extras import RealDictCursor
 
 from utils import get_db_connection
 
+import numpy as np
+
 
 BASE_DIR = Path(__file__).resolve().parent
 
