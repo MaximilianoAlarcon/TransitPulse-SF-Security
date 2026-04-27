@@ -769,3 +769,45 @@ body {
   border-radius: 999px;
   display: inline-block;
 }
+
+
+/* Risk projections */
+.risk-projection-controls .form-label {
+  margin-bottom: 6px;
+}
+
+.risk-projection-status-ok {
+  color: #b9f4d3 !important;
+}
+
+.risk-projection-status-error {
+  color: #ffd0d0 !important;
+}
+
+.risk-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.risk-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.risk-legend-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  display: inline-block;
+}
+
+.risk-projection-panel .roadmap-item,
+.volume-projection-panel .roadmap-item {
+  gap: 6px;
+}
+

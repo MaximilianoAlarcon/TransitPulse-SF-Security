@@ -14,7 +14,8 @@ const appState = {
   layers: {
     incidents: null,
     heat: null,
-    volumeForecast: null
+    volumeForecast: null,
+    riskForecast: null
   },
   mapData: {
     points: [],
@@ -534,6 +535,11 @@ function clearMapLayers() {
     appState.map.removeLayer(appState.layers.volumeForecast);
     appState.layers.volumeForecast = null;
   }
+
+  if (appState.layers.riskForecast) {
+    appState.map.removeLayer(appState.layers.riskForecast);
+    appState.layers.riskForecast = null;
+  }
 }
 
 function volumeRiskColor(level) {
@@ -548,6 +554,53 @@ function volumeRiskOpacity(level) {
   if (level === 'medium') return 0.48;
   if (level === 'low') return 0.38;
   return 0.14;
+}
+
+function normalizedRiskRatio(score, maxScore) {
+  const numericScore = Math.max(0, Number(score || 0));
+  const numericMax = Math.max(0, Number(maxScore || 0));
+
+  if (!Number.isFinite(numericScore) || !Number.isFinite(numericMax) || numericMax <= 0) {
+    return 0;
+  }
+
+  return Math.max(0, Math.min(1, numericScore / numericMax));
+}
+
+function riskProjectionColor(score, maxScore) {
+  const ratio = normalizedRiskRatio(score, maxScore);
+
+  if (ratio >= 0.85) return '#7f1d1d';
+  if (ratio >= 0.65) return '#dc2626';
+  if (ratio >= 0.45) return '#f97316';
+  if (ratio >= 0.25) return '#facc15';
+  return '#84cc16';
+}
+
+function riskProjectionOpacity(score, maxScore) {
+  const ratio = normalizedRiskRatio(score, maxScore);
+  return Math.max(0.24, Math.min(0.72, 0.24 + ratio * 0.44));
+}
+
+function riskProjectionPopupHtml(properties = {}) {
+  const categories = Array.isArray(properties.top_risk_categories) ? properties.top_risk_categories : [];
+  const topCategoriesHtml = categories.length > 0
+    ? categories.map((item) => {
+        return `<li>#${item.rank || '-'} ${item.incident_category}: ${formatNumber(item.risk_score, 4)}</li>`;
+      }).join('')
+    : '<li>No risk categories available</li>';
+
+  return `
+    <div class="popup-card">
+      <strong>${properties.police_district || 'Unknown district'}</strong><br>
+      <span>District risk: ${(properties.risk_level || 'Low').toUpperCase()}</span><br>
+      <span>Max risk score: ${formatNumber(properties.risk_score_max || 0, 4)}</span><br>
+      <span>Avg risk score: ${formatNumber(properties.risk_score_avg || 0, 4)}</span><br>
+      <hr>
+      <strong>Top risk categories</strong>
+      <ul>${topCategoriesHtml}</ul>
+    </div>
+  `;
 }
 
 function volumeProjectionPopupHtml(properties = {}) {
@@ -610,6 +663,25 @@ function initializeVolumeProjectionTimeInput() {
 
 function getVolumeProjectionTargetTimestamp() {
   const input = document.getElementById('volume-projection-time');
+
+  if (!input || !input.value) {
+    return getCurrentSfDateTimeLocalValue();
+  }
+
+  return input.value;
+}
+
+function initializeRiskProjectionTimeInput() {
+  const input = document.getElementById('risk-projection-time');
+  if (!input) return;
+
+  if (!input.value) {
+    input.value = getCurrentSfDateTimeLocalValue();
+  }
+}
+
+function getRiskProjectionTargetTimestamp() {
+  const input = document.getElementById('risk-projection-time');
 
   if (!input || !input.value) {
     return getCurrentSfDateTimeLocalValue();
@@ -833,6 +905,183 @@ function bindVolumeProjectionButton() {
   button.addEventListener('click', loadVolumeProjections);
 }
 
+function updateRiskProjectionStatus(text, isError = false) {
+  const el = document.getElementById('risk-projection-status');
+  if (!el) return;
+  el.textContent = text;
+  el.classList.toggle('risk-projection-status-error', isError);
+  el.classList.toggle('risk-projection-status-ok', !isError && text !== 'Not loaded yet.');
+}
+
+function renderRiskProjectionSummary(payload) {
+  const container = document.getElementById('risk-projection-summary');
+  if (!container) return;
+
+  const summary = payload?.summary || {};
+  const maxScore = formatNumber(summary.max_risk_score || 0, 4);
+  const avgScore = formatNumber(summary.avg_risk_score || 0, 4);
+  const mapped = formatNumber(summary.mapped_districts || 0, 0);
+  const rows = formatNumber(summary.prediction_rows || 0, 0);
+
+  const thresholds = payload?.risk_score_thresholds || {};
+  const statusEl = document.getElementById('risk-projection-status');
+  const currentStatus = statusEl ? statusEl.textContent : 'Loaded.';
+
+  container.innerHTML = `
+    <div class="roadmap-item">
+      <strong>Relative district risk</strong>
+      <span>Max score ${maxScore}, average score ${avgScore} across ${mapped} mapped districts.</span>
+    </div>
+    <div class="roadmap-item">
+      <strong>Model rows</strong>
+      <span>${rows} district/category risk projections used for this layer.</span>
+    </div>
+    <div class="roadmap-item">
+      <strong>Projection time</strong>
+      <span>${formatProjectionTimestampLabel(payload?.filters?.target_timestamp)}</span>
+    </div>
+    <div class="roadmap-item">
+      <strong>Risk thresholds</strong>
+      <span>Medium ${formatNumber(thresholds.medium || 0, 4)} · High ${formatNumber(thresholds.high || 0, 4)} · Very High ${formatNumber(thresholds.very_high || 0, 4)}</span>
+    </div>
+    <div class="risk-legend">
+      <span class="risk-legend-item"><span class="risk-legend-swatch" style="background:#7f1d1d"></span>Highest relative risk</span>
+      <span class="risk-legend-item"><span class="risk-legend-swatch" style="background:#f97316"></span>Elevated</span>
+      <span class="risk-legend-item"><span class="risk-legend-swatch" style="background:#84cc16"></span>Lower</span>
+    </div>
+
+    <div class="risk-projection-controls mt-3">
+      <label class="form-label" for="risk-projection-time">Projection time (SF)</label>
+      <input
+        id="risk-projection-time"
+        class="form-control app-control"
+        type="datetime-local"
+        value="${payload?.filters?.target_timestamp && payload.filters.target_timestamp !== 'latest' ? payload.filters.target_timestamp.slice(0, 16) : getCurrentSfDateTimeLocalValue()}"
+      >
+      <div class="small-muted mt-1">All projection times are interpreted as San Francisco local time.</div>
+    </div>
+
+    <button id="load-risk-projections" class="btn btn-sm btn-outline-light w-100 mt-3" type="button">
+      Reload risk projections
+    </button>
+    <div id="risk-projection-status" class="small-muted mt-2">${currentStatus || 'Loaded.'}</div>
+  `;
+
+  bindRiskProjectionButton();
+}
+
+function renderRiskForecastPolygons(payload) {
+  clearMapLayers();
+
+  const featureCollection = buildCleanFeatureCollection(payload);
+  const features = featureCollection.features;
+  const maxRiskScore = Number(payload?.summary?.max_risk_score || payload?.max_risk_score || 0);
+
+  appState.layers.riskForecast = L.geoJSON(featureCollection, {
+    renderer: L.svg(),
+    style: (feature) => {
+      const score = Number(feature?.properties?.risk_score_max || 0);
+      return {
+        color: 'rgba(255,255,255,0.78)',
+        weight: 1.15,
+        opacity: 0.95,
+        fillColor: riskProjectionColor(score, maxRiskScore),
+        fillOpacity: riskProjectionOpacity(score, maxRiskScore),
+        lineJoin: 'round',
+        lineCap: 'round'
+      };
+    },
+    onEachFeature: (feature, layer) => {
+      const properties = feature.properties || {};
+      const score = formatNumber(properties.risk_score_max || 0, 4);
+      const label = `${properties.police_district || 'District'} · ${properties.risk_level || 'Risk'} · ${score}`;
+
+      layer.bindPopup(riskProjectionPopupHtml(properties));
+      layer.bindTooltip(label, {
+        sticky: true,
+        direction: 'top',
+        opacity: 0.92
+      });
+
+      layer.on('mouseover', () => {
+        const layerScore = Number(properties.risk_score_max || 0);
+        layer.setStyle({
+          weight: 2.2,
+          color: 'rgba(255,255,255,0.96)',
+          fillOpacity: Math.min(riskProjectionOpacity(layerScore, maxRiskScore) + 0.12, 0.82)
+        });
+        layer.bringToFront();
+      });
+
+      layer.on('mouseout', () => {
+        appState.layers.riskForecast.resetStyle(layer);
+      });
+    }
+  }).addTo(appState.map);
+
+  if (features.length > 0) {
+    const bounds = appState.layers.riskForecast.getBounds();
+    if (bounds && bounds.isValid()) {
+      appState.map.fitBounds(bounds.pad(0.04));
+    }
+  } else {
+    appState.map.setView([37.7749, -122.4194], 12);
+  }
+
+  const caption = document.getElementById('map-caption');
+  if (caption) {
+    caption.textContent = `ML risk projections · max score ${formatNumber(maxRiskScore, 4)} · ${formatNumber(features.length, 0)} districts`;
+  }
+
+  renderRiskProjectionSummary(payload);
+  requestMapResize();
+}
+
+async function loadRiskProjections() {
+  const button = document.getElementById('load-risk-projections');
+  if (button) {
+    button.disabled = true;
+    button.textContent = 'Loading risk projections…';
+  }
+
+  updateStatus('Loading risk projections…');
+  updateRiskProjectionStatus('Loading risk polygons…');
+
+  try {
+    initializeRiskProjectionTimeInput();
+
+    const targetTimestamp = getRiskProjectionTargetTimestamp();
+
+    const payload = await apiGet('/api/dashboard/ml-risk-polygons', {
+      target_timestamp: targetTimestamp,
+      district: 'all',
+      category: 'all'
+    });
+
+    renderRiskForecastPolygons(payload);
+    updateStatus('Risk projections loaded');
+    updateRiskProjectionStatus('Risk polygons loaded.');
+  } catch (error) {
+    console.error(error);
+    updateStatus('Failed to load risk projections', true);
+    updateRiskProjectionStatus('Failed to load risk polygons.', true);
+  } finally {
+    const refreshedButton = document.getElementById('load-risk-projections');
+    if (refreshedButton) {
+      refreshedButton.disabled = false;
+      refreshedButton.textContent = appState.layers.riskForecast ? 'Reload risk projections' : 'Load risk projections';
+    }
+  }
+}
+
+function bindRiskProjectionButton() {
+  const button = document.getElementById('load-risk-projections');
+  if (!button || button.dataset.bound === 'true') return;
+
+  button.dataset.bound = 'true';
+  button.addEventListener('click', loadRiskProjections);
+}
+
 
 function renderMap(payload) {
   const points = Array.isArray(payload?.points) ? payload.points : [];
@@ -1036,7 +1285,9 @@ function bindEvents() {
   });
 
   initializeVolumeProjectionTimeInput();
+  initializeRiskProjectionTimeInput();
   bindVolumeProjectionButton();
+  bindRiskProjectionButton();
 
   document.getElementById('btn-center-sf')?.addEventListener('click', () => {
     appState.map.setView([37.7749, -122.4194], 12);
