@@ -632,10 +632,17 @@ def load_risk_model() -> tuple[Any, str]:
     return model, str(RISK_MODEL_CACHE["source"])
 
 
-def risk_level_from_score(score: float) -> str:
-    if score >= 0.22:
+
+def risk_level_from_score(score):
+    # ejemplo simple
+    p50 = np.percentile(scores, 50)
+    p75 = np.percentile(scores, 75)
+    p90 = np.percentile(scores, 90)
+    if score >= p90:
+        return "Very High"
+    if score >= p75:
         return "High"
-    if score >= 0.15:
+    if score >= p50:
         return "Medium"
     return "Low"
 
