@@ -9,7 +9,6 @@ from psycopg2.extras import RealDictCursor
 
 from utils import get_db_connection
 
-import numpy as np
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -635,16 +634,83 @@ def load_risk_model() -> tuple[Any, str]:
 
 
 
-def risk_level_from_score(score):
-    # ejemplo simple
-    p50 = np.percentile(scores, 50)
-    p75 = np.percentile(scores, 75)
-    p90 = np.percentile(scores, 90)
-    if score >= p90:
-        return "Very High"
-    if score >= p75:
+def percentile_from_sorted(sorted_values: list[float], percentile: float) -> float:
+    """
+    Lightweight percentile helper without numpy.
+
+    Uses nearest-rank style indexing, which is enough for dashboard calibration.
+    Expected percentile values are in [0, 1], for example 0.50, 0.75, 0.90.
+    """
+    if not sorted_values:
+        return 0.0
+
+    safe_percentile = max(0.0, min(1.0, float(percentile)))
+    index = round((len(sorted_values) - 1) * safe_percentile)
+    index = max(0, min(index, len(sorted_values) - 1))
+    return float(sorted_values[index])
+
+
+def build_risk_score_thresholds(scores: list[float]) -> dict[str, float]:
+    """
+    Build dynamic thresholds from the current prediction batch.
+
+    The V2 risk model is intentionally contextual and tends to produce compressed
+    scores. Dynamic thresholds make the dashboard show relative risk differences
+    without pretending these are absolute crime probabilities.
+    """
+    clean_scores = sorted(
+        max(0.0, min(1.0, float(score)))
+        for score in scores
+        if score is not None
+    )
+
+    if not clean_scores:
+        return {
+            "medium": 0.0,
+            "high": 0.0,
+            "very_high": 0.0,
+        }
+
+    return {
+        "medium": percentile_from_sorted(clean_scores, 0.50),
+        "high": percentile_from_sorted(clean_scores, 0.75),
+        "very_high": percentile_from_sorted(clean_scores, 0.90),
+    }
+
+
+def risk_level_from_score(
+    score: float,
+    thresholds: dict[str, float] | None = None,
+) -> str:
+    """
+    Convert a risk score into a display level.
+
+    If thresholds are provided, levels are relative to the current batch.
+    If thresholds are not provided, fixed V2 fallback thresholds are used.
+    """
+    score_value = max(0.0, min(1.0, float(score or 0)))
+
+    if thresholds:
+        very_high = float(thresholds.get("very_high", 0.0))
+        high = float(thresholds.get("high", 0.0))
+        medium = float(thresholds.get("medium", 0.0))
+
+        # If all scores are identical, avoid labeling everything Very High.
+        if abs(very_high - medium) < 1e-12:
+            return "Low"
+
+        if score_value >= very_high:
+            return "Very High"
+        if score_value >= high:
+            return "High"
+        if score_value >= medium:
+            return "Medium"
+        return "Low"
+
+    # Fixed fallback calibrated for risk_classifier_random_forest_v2.
+    if score_value >= 0.22:
         return "High"
-    if score >= p50:
+    if score_value >= 0.15:
         return "Medium"
     return "Low"
 
@@ -829,14 +895,17 @@ def predict_risk_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         probabilities = None
         classifier_classes = []
 
+    score_values = [max(0.0, min(1.0, float(score))) for score in predicted_scores]
+    score_thresholds = build_risk_score_thresholds(score_values)
+
     predictions: list[dict[str, Any]] = []
 
-    for index, (row, level_id, score) in enumerate(zip(rows, predicted_level_ids, predicted_scores)):
-        score_value = max(0.0, min(1.0, float(score)))
+    for index, (row, level_id, score_value) in enumerate(zip(rows, predicted_level_ids, score_values)):
         level_id_int = int(level_id)
-        level = int_to_level.get(level_id_int) or (
-            level_order[level_id_int] if 0 <= level_id_int < len(level_order) else risk_level_from_score(score_value)
-        )
+
+        # The regressor score is the source of truth for the visual/dashboard level.
+        # The classifier probability is kept only as a confidence/debug signal.
+        level = risk_level_from_score(score_value, score_thresholds)
 
         feature_timestamp = row.get("feature_timestamp")
         forecast_for = feature_timestamp + timedelta(hours=1) if feature_timestamp else None
@@ -869,6 +938,11 @@ def predict_risk_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "row_count": len(predictions),
         "predictions": predictions,
+        "risk_score_thresholds": {
+            key: round(value, 4)
+            for key, value in score_thresholds.items()
+        },
+        "level_strategy": "dynamic_score_percentiles",
         "model_source": model_source,
         "model_runtime_type": model_bundle.get("model_type") if isinstance(model_bundle, dict) else type(model_bundle).__name__,
     }
@@ -926,7 +1000,13 @@ def build_risk_forecast_geojson(
         entry["risk_score_avg"] = round(entry["risk_score_sum"] / category_count, 4)
         entry["risk_score_max"] = round(entry["risk_score_max"], 4)
         entry["risk_level_probability_max"] = round(entry["risk_level_probability_max"], 4)
-        entry["risk_level"] = classify_district_risk_level(entry["risk_score_max"])
+
+    district_score_thresholds = build_risk_score_thresholds(
+        [entry["risk_score_max"] for entry in by_district.values()]
+    )
+
+    for entry in by_district.values():
+        entry["risk_level"] = risk_level_from_score(entry["risk_score_max"], district_score_thresholds)
         entry["categories"] = sorted(
             entry["categories"],
             key=lambda row: (row["risk_score"], risk_level_sort_value(row["risk_level"])),
@@ -989,5 +1069,10 @@ def build_risk_forecast_geojson(
             sum(item["risk_score_avg"] for item in by_district.values()) / max(1, len(by_district)),
             4,
         ),
+        "risk_score_thresholds": {
+            key: round(value, 4)
+            for key, value in district_score_thresholds.items()
+        },
+        "level_strategy": "dynamic_district_score_percentiles",
     }
 
