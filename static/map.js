@@ -13,7 +13,8 @@ const appState = {
   map: null,
   layers: {
     incidents: null,
-    heat: null
+    heat: null,
+    volumeForecast: null
   },
   mapData: {
     points: [],
@@ -463,7 +464,6 @@ function getHeatWeight(score) {
 function updateMapCaption() {
   const caption = document.getElementById('map-caption');
   if (!caption) return;
-  console.log("Updating caption")
   const layerLabel = appState.filters.mapLayer === 'heat' ? 'Density view' : 'Incidents';
   const riskLabelMap = {
     volume: 'Volume',
@@ -471,8 +471,6 @@ function updateMapCaption() {
     delay: 'Report delay'
   };
   const riskLabel = riskLabelMap[appState.filters.riskMode] || 'Volume';
-  console.log("riskLabel")
-  console.log(riskLabel)
   caption.textContent = `${layerLabel} · ${riskLabel} · ${formatNumber(appState.mapData.pointCount || 0)} points`;
 }
 
@@ -518,11 +516,199 @@ function riskColor(level) {
   return '#66c7f4';
 }
 
+
+function clearMapLayers() {
+  if (appState.layers.incidents) {
+    appState.layers.incidents.clearLayers();
+    if (appState.map.hasLayer(appState.layers.incidents)) {
+      appState.map.removeLayer(appState.layers.incidents);
+    }
+  }
+
+  if (appState.layers.heat) {
+    appState.map.removeLayer(appState.layers.heat);
+    appState.layers.heat = null;
+  }
+
+  if (appState.layers.volumeForecast) {
+    appState.map.removeLayer(appState.layers.volumeForecast);
+    appState.layers.volumeForecast = null;
+  }
+}
+
+function volumeRiskColor(level) {
+  if (level === 'high') return '#ff6b6b';
+  if (level === 'medium') return '#f7b267';
+  if (level === 'low') return '#7dd3a7';
+  return '#1f2937';
+}
+
+function volumeRiskOpacity(level) {
+  if (level === 'high') return 0.58;
+  if (level === 'medium') return 0.48;
+  if (level === 'low') return 0.38;
+  return 0.14;
+}
+
+function volumeProjectionPopupHtml(properties = {}) {
+  const categories = Array.isArray(properties.top_categories) ? properties.top_categories : [];
+  const topCategoriesHtml = categories.length > 0
+    ? categories.map((item) => {
+        const probability = Number(item.event_probability_next_hour || 0) * 100;
+        return `<li>${item.incident_category}: ${formatNumber(item.predicted_incidents_next_hour, 4)} · ${formatNumber(probability, 1)}%</li>`;
+      }).join('')
+    : '<li>No projected activity</li>';
+
+  return `
+    <div class="popup-card">
+      <strong>${properties.police_district || 'Unknown district'}</strong><br>
+      <span>Projected incidents: ${formatNumber(properties.predicted_incidents_next_hour, 4)}</span><br>
+      <span>Max event probability: ${formatNumber(Number(properties.event_probability_max || 0) * 100, 1)}%</span><br>
+      <span>Level: ${(properties.risk_level || 'none').toUpperCase()}</span>
+      <hr>
+      <strong>Top categories</strong>
+      <ul>${topCategoriesHtml}</ul>
+    </div>
+  `;
+}
+
+function updateVolumeProjectionStatus(text, isError = false) {
+  const el = document.getElementById('volume-projection-status');
+  if (!el) return;
+  el.textContent = text;
+  el.classList.toggle('volume-projection-status-error', isError);
+  el.classList.toggle('volume-projection-status-ok', !isError && text !== 'Not loaded yet.');
+}
+
+function renderVolumeProjectionSummary(payload) {
+  const container = document.getElementById('volume-projection-summary');
+  if (!container) return;
+
+  const summary = payload?.summary || {};
+  const total = formatNumber(summary.total_predicted_incidents_next_hour || 0, 4);
+  const mapped = formatNumber(summary.mapped_districts || 0, 0);
+  const rows = formatNumber(summary.prediction_rows || 0, 0);
+
+  const statusEl = document.getElementById('volume-projection-status');
+  const currentStatus = statusEl ? statusEl.textContent : 'Loaded.';
+
+  container.innerHTML = `
+    <div class="roadmap-item">
+      <strong>Expected next hour</strong>
+      <span>${total} projected incidents across ${mapped} mapped districts.</span>
+    </div>
+    <div class="roadmap-item">
+      <strong>Model rows</strong>
+      <span>${rows} district/category projections used for this layer.</span>
+    </div>
+    <div class="volume-legend">
+      <span class="volume-legend-item"><span class="volume-legend-swatch" style="background:#ff6b6b"></span>High</span>
+      <span class="volume-legend-item"><span class="volume-legend-swatch" style="background:#f7b267"></span>Medium</span>
+      <span class="volume-legend-item"><span class="volume-legend-swatch" style="background:#7dd3a7"></span>Low</span>
+      <span class="volume-legend-item"><span class="volume-legend-swatch" style="background:#1f2937"></span>None</span>
+    </div>
+    <button id="load-volume-projections" class="btn btn-sm btn-outline-light w-100 mt-2" type="button">
+      Reload volume projections
+    </button>
+    <div id="volume-projection-status" class="small-muted mt-2">${currentStatus || 'Loaded.'}</div>
+  `;
+
+  bindVolumeProjectionButton();
+}
+
+function renderVolumeForecastPolygons(payload) {
+  clearMapLayers();
+
+  const features = Array.isArray(payload?.features) ? payload.features : [];
+
+  appState.layers.volumeForecast = L.geoJSON(payload, {
+    style: (feature) => {
+      const level = feature?.properties?.risk_level || 'none';
+      return {
+        color: 'rgba(255,255,255,0.62)',
+        weight: 1,
+        opacity: 0.9,
+        fillColor: volumeRiskColor(level),
+        fillOpacity: volumeRiskOpacity(level)
+      };
+    },
+    onEachFeature: (feature, layer) => {
+      const properties = feature.properties || {};
+      const projected = formatNumber(properties.predicted_incidents_next_hour || 0, 4);
+      const label = `${properties.police_district || 'District'} · ${projected}`;
+
+      layer.bindPopup(volumeProjectionPopupHtml(properties));
+      layer.bindTooltip(label, {
+        sticky: true,
+        direction: 'top',
+        opacity: 0.92
+      });
+    }
+  }).addTo(appState.map);
+
+  if (features.length > 0) {
+    const bounds = appState.layers.volumeForecast.getBounds();
+    if (bounds && bounds.isValid()) {
+      appState.map.fitBounds(bounds.pad(0.04));
+    }
+  } else {
+    appState.map.setView([37.7749, -122.4194], 12);
+  }
+
+  const caption = document.getElementById('map-caption');
+  if (caption) {
+    const total = payload?.summary?.total_predicted_incidents_next_hour ?? 0;
+    caption.textContent = `ML volume projections · ${formatNumber(total, 4)} expected incidents next hour`;
+  }
+
+  renderVolumeProjectionSummary(payload);
+  requestMapResize();
+}
+
+async function loadVolumeProjections() {
+  const button = document.getElementById('load-volume-projections');
+  if (button) {
+    button.disabled = true;
+    button.textContent = 'Loading projections…';
+  }
+
+  updateStatus('Loading volume projections…');
+  updateVolumeProjectionStatus('Loading forecast polygons…');
+
+  try {
+    const payload = await apiGet('/api/dashboard/ml-volume-polygons', {
+      target_timestamp: 'latest',
+      district: 'all',
+      category: 'all'
+    });
+
+    renderVolumeForecastPolygons(payload);
+    updateStatus('Volume projections loaded');
+    updateVolumeProjectionStatus('Forecast polygons loaded.');
+  } catch (error) {
+    console.error(error);
+    updateStatus('Failed to load volume projections', true);
+    updateVolumeProjectionStatus('Failed to load forecast polygons.', true);
+  } finally {
+    const refreshedButton = document.getElementById('load-volume-projections');
+    if (refreshedButton) {
+      refreshedButton.disabled = false;
+      refreshedButton.textContent = appState.layers.volumeForecast ? 'Reload volume projections' : 'Load volume projections';
+    }
+  }
+}
+
+function bindVolumeProjectionButton() {
+  const button = document.getElementById('load-volume-projections');
+  if (!button || button.dataset.bound === 'true') return;
+
+  button.dataset.bound = 'true';
+  button.addEventListener('click', loadVolumeProjections);
+}
+
+
 function renderMap(payload) {
-  console.log("Redering")
   const points = Array.isArray(payload?.points) ? payload.points : [];
-  console.log("points")
-  console.log(points)
   appState.mapData = {
     points,
     center: payload?.center || null,
@@ -532,11 +718,8 @@ function renderMap(payload) {
 
   updateMapCaption();
 
-  appState.layers.incidents.clearLayers();
-  if (appState.layers.heat) {
-    appState.map.removeLayer(appState.layers.heat);
-    appState.layers.heat = null;
-  }
+  clearMapLayers();
+  appState.layers.incidents.addTo(appState.map);
 
   const heatData = [];
   const validLatLngs = [];
@@ -635,9 +818,6 @@ async function refreshDashboard() {
       apiGet('/api/dashboard/forecast-training-summary', getCommonParams())
     ]);
 
-    console.log("mapData")
-    console.log(mapData)
-
     updateKPIs(overview.kpis || {});
     renderTrendChart(trend);
     renderDistricts(districts.districts || []);
@@ -727,6 +907,8 @@ function bindEvents() {
 
     refreshDashboard();
   });
+
+  bindVolumeProjectionButton();
 
   document.getElementById('btn-center-sf')?.addEventListener('click', () => {
     appState.map.setView([37.7749, -122.4194], 12);

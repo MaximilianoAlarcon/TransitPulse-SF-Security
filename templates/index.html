@@ -133,7 +133,7 @@
           </div>
         </section>
 
-        <section class="glass-card collapsible-card" data-collapsible>
+        <section class="glass-card collapsible-card mb-3" data-collapsible>
           <div class="section-heading collapsible-header">
             <div>
               <h2>Forecast base</h2>
@@ -145,6 +145,32 @@
           </div>
           <div class="collapsible-body mt-3">
             <div id="forecast-summary" class="roadmap-list"></div>
+          </div>
+        </section>
+
+        <section class="glass-card collapsible-card" data-collapsible>
+          <div class="section-heading collapsible-header">
+            <div>
+              <h2>Volume projections</h2>
+              <span class="small-muted">ML forecast polygons for next hour</span>
+            </div>
+            <button class="btn btn-sm btn-outline-light collapse-toggle" type="button" aria-expanded="true">
+              Hide
+            </button>
+          </div>
+          <div class="collapsible-body mt-3">
+            <div id="volume-projection-summary" class="volume-projection-panel">
+              <div class="roadmap-item">
+                <strong>Forecast layer</strong>
+                <span>Load ML projections only when you want to inspect forecast polygons.</span>
+              </div>
+              <button id="load-volume-projections" class="btn btn-sm btn-outline-light w-100 mt-2" type="button">
+                Load volume projections
+              </button>
+              <div id="volume-projection-status" class="small-muted mt-2">
+                Not loaded yet.
+              </div>
+            </div>
           </div>
         </section>
       </div>
