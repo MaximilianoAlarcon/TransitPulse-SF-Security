@@ -633,8 +633,6 @@ def load_risk_model() -> tuple[Any, str]:
 
 
 def risk_level_from_score(score: float) -> str:
-    if score >= 0.30:
-        return "Very High"
     if score >= 0.22:
         return "High"
     if score >= 0.15:
