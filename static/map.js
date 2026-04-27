@@ -616,20 +616,49 @@ function renderVolumeProjectionSummary(payload) {
   bindVolumeProjectionButton();
 }
 
+function buildCleanFeatureCollection(payload) {
+  const features = Array.isArray(payload?.features) ? payload.features : [];
+
+  const cleanFeatures = features
+    .filter((feature) => {
+      const geometryType = feature?.geometry?.type;
+      const coordinates = feature?.geometry?.coordinates;
+      return (
+        feature?.type === 'Feature' &&
+        (geometryType === 'Polygon' || geometryType === 'MultiPolygon') &&
+        Array.isArray(coordinates)
+      );
+    })
+    .map((feature) => ({
+      type: 'Feature',
+      geometry: feature.geometry,
+      properties: feature.properties || {}
+    }));
+
+  return {
+    type: 'FeatureCollection',
+    features: cleanFeatures
+  };
+}
+
 function renderVolumeForecastPolygons(payload) {
   clearMapLayers();
 
-  const features = Array.isArray(payload?.features) ? payload.features : [];
+  const featureCollection = buildCleanFeatureCollection(payload);
+  const features = featureCollection.features;
 
-  appState.layers.volumeForecast = L.geoJSON(payload, {
+  appState.layers.volumeForecast = L.geoJSON(featureCollection, {
+    renderer: L.svg(),
     style: (feature) => {
       const level = feature?.properties?.risk_level || 'none';
       return {
-        color: 'rgba(255,255,255,0.62)',
-        weight: 1,
-        opacity: 0.9,
+        color: 'rgba(255,255,255,0.72)',
+        weight: 1.15,
+        opacity: 0.95,
         fillColor: volumeRiskColor(level),
-        fillOpacity: volumeRiskOpacity(level)
+        fillOpacity: volumeRiskOpacity(level),
+        lineJoin: 'round',
+        lineCap: 'round'
       };
     },
     onEachFeature: (feature, layer) => {
@@ -642,6 +671,19 @@ function renderVolumeForecastPolygons(payload) {
         sticky: true,
         direction: 'top',
         opacity: 0.92
+      });
+
+      layer.on('mouseover', () => {
+        layer.setStyle({
+          weight: 2.2,
+          color: 'rgba(255,255,255,0.95)',
+          fillOpacity: Math.min(volumeRiskOpacity(properties.risk_level) + 0.12, 0.72)
+        });
+        layer.bringToFront();
+      });
+
+      layer.on('mouseout', () => {
+        appState.layers.volumeForecast.resetStyle(layer);
       });
     }
   }).addTo(appState.map);

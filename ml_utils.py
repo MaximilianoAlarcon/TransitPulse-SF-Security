@@ -396,10 +396,10 @@ def load_police_districts_geojson() -> dict[str, Any]:
 
 
 def classify_projected_volume(value: float) -> str:
-    if value >= 0.35:
+    if value >= 0.75:
         return "high"
 
-    if value >= 0.15:
+    if value >= 0.40:
         return "medium"
 
     if value > 0:

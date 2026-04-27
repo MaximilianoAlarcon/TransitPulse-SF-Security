@@ -19,6 +19,8 @@ from utils import execute_query, execute_sql_file, get_db_connection
 from zoneinfo import ZoneInfo
 
 from ml_utils import (
+    MODEL_BUCKET_NAME,
+    MODEL_DIR,
     VOLUME_MODEL_NAME,
     build_volume_forecast_geojson,
     fetch_latest_volume_features,
@@ -916,6 +918,23 @@ def api_dashboard_forecast_training_summary():
 
 
 
+SF_TZ = ZoneInfo("America/Los_Angeles")
+
+def parse_sf_target_timestamp(raw_value: str) -> datetime | None:
+    raw_value = (raw_value or "").strip()
+
+    if not raw_value or raw_value.lower() == "latest":
+        return None
+
+    parsed = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+
+    if parsed.tzinfo is not None:
+        return parsed.astimezone(SF_TZ).replace(tzinfo=None)
+
+    return parsed
+
+
+
 @app.route("/admin/ml/volume/model-info", methods=["GET"])
 @require_admin_token
 def admin_ml_volume_model_info():
@@ -941,13 +960,18 @@ def admin_ml_volume_predict():
     district = (payload.get("district") or "").strip() or None
     category = (payload.get("category") or "").strip() or None
 
-    target_timestamp = None
-    raw_target_timestamp = (payload.get("target_timestamp") or "").strip()
-    if raw_target_timestamp:
-        try:
-            target_timestamp = datetime.fromisoformat(raw_target_timestamp.replace("Z", "+00:00")).replace(tzinfo=None)
-        except ValueError:
-            return jsonify({"status": "error", "message": "Invalid target_timestamp. Use ISO format, for example 2026-04-24T22:00:00."}), 400
+    raw_target_timestamp = (payload.get("target_timestamp") or "latest").strip()
+    try:
+        target_timestamp = parse_sf_target_timestamp(raw_target_timestamp)
+    except ValueError:
+        return jsonify({
+            "status": "error",
+            "message": (
+                "Invalid target_timestamp. Use 'latest', a San Francisco local timestamp "
+                "like 2026-04-24T22:00:00, or an ISO timestamp with timezone like "
+                "2026-04-25T05:00:00Z."
+            ),
+        }), 400
 
     try:
         rows = fetch_latest_volume_features(
@@ -1012,22 +1036,6 @@ def admin_etl_run():
             return jsonify({"status": "error", "message": message}), 500
     except Exception as exc:
         return jsonify({"status": "error", "message": str(exc)}), 400
-
-
-SF_TZ = ZoneInfo("America/Los_Angeles")
-
-def parse_sf_target_timestamp(raw_value: str) -> datetime | None:
-    raw_value = (raw_value or "").strip()
-
-    if not raw_value or raw_value.lower() == "latest":
-        return None
-
-    parsed = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
-
-    if parsed.tzinfo is not None:
-        return parsed.astimezone(SF_TZ).replace(tzinfo=None)
-
-    return parsed
 
 
 @app.route("/api/dashboard/ml-volume-polygons", methods=["GET"])
