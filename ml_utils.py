@@ -510,7 +510,7 @@ def build_volume_forecast_geojson(
 
 RISK_CLASSIFIER_MODEL_NAME = os.environ.get(
     "RISK_CLASSIFIER_MODEL_NAME",
-    "risk_classifier_random_forest_v2",
+    "risk_classifier_random_forest_v3",
 )
 
 RISK_MODEL_CACHE: dict[str, Any] = {
@@ -540,6 +540,9 @@ RISK_DERIVED_NUMERIC_FEATURES = [
     "district_activity_share_24h",
     "category_activity_share_24h",
     "recent_pressure_score",
+    "short_term_surge_score",
+    "category_surge_score",
+    "district_surge_score",
     "severity_pressure_interaction",
 ]
 
@@ -662,7 +665,7 @@ def build_risk_score_thresholds(scores: list[float]) -> dict[str, Any]:
     Build dynamic thresholds from the current prediction batch.
 
     Important:
-    risk_classifier_random_forest_v2 can produce compressed and repeated scores.
+    risk_classifier_random_forest_v3 can produce compressed and repeated scores.
     If many districts share the same score, simple p50/p75/p90 thresholds can
     collapse to the same value. To avoid making every district Low, this function
     also calculates unique-score thresholds and exposes min/max/unique_count.
@@ -734,10 +737,12 @@ def risk_level_from_score(
             return "Medium"
         return "Low"
 
-    # Fixed fallback calibrated for risk_classifier_random_forest_v2.
-    if score_value >= 0.22:
+    # Fixed fallback calibrated for risk_classifier_random_forest_v3.
+    if score_value >= 0.28:
+        return "Very High"
+    if score_value >= 0.20:
         return "High"
-    if score_value >= 0.15:
+    if score_value >= 0.12:
         return "Medium"
     return "Low"
 
@@ -893,16 +898,53 @@ def add_risk_derived_features_to_df(df: Any) -> Any:
         df["incidents_last_24h"] / district_total_last_24h
     ).fillna(0.0)
 
+    # V3: dynamic short-term pressure. 1h and 3h dominate; long-term history is only context.
     df["recent_pressure_score"] = (
-        0.45 * _minmax_pandas_series(df["incidents_last_1h"])
-        + 0.25 * _minmax_pandas_series(df["incidents_last_3h"])
-        + 0.20 * _minmax_pandas_series(df["incidents_last_24h"])
-        + 0.10 * _minmax_pandas_series(df["district_incidents_last_24h"])
+        0.62 * _minmax_pandas_series(df["incidents_last_1h"])
+        + 0.28 * _minmax_pandas_series(df["incidents_last_3h"])
+        + 0.10 * _minmax_pandas_series(df["incidents_last_6h"])
+    ).clip(0, 1)
+
+    # Inference-safe surge features. These are calculated from the current feature batch.
+    # They approximate "unusual for this district/category/hour" without needing extra DB queries.
+    baseline_keys = ["police_district", "incident_category", "hour_of_day"]
+    district_hour_keys = ["police_district", "hour_of_day"]
+    category_hour_keys = ["incident_category", "hour_of_day"]
+
+    baseline_3h = df.groupby(baseline_keys)["incidents_last_3h"].transform("mean").replace(0, pd.NA)
+    baseline_24h = df.groupby(baseline_keys)["incidents_last_24h"].transform("mean").replace(0, pd.NA)
+    district_baseline_24h = (
+        df.groupby(district_hour_keys)["district_incidents_last_24h"].transform("mean").replace(0, pd.NA)
+    )
+    category_baseline_24h = (
+        df.groupby(category_hour_keys)["category_citywide_last_24h"].transform("mean").replace(0, pd.NA)
+    )
+
+    category_surge_raw = (
+        (df["incidents_last_3h"] / baseline_3h).fillna(0.0)
+        + (df["incidents_last_24h"] / baseline_24h).fillna(0.0)
+    ) / 2.0
+    district_surge_raw = (
+        df["district_incidents_last_24h"] / district_baseline_24h
+    ).fillna(0.0)
+    category_citywide_surge_raw = (
+        df["category_citywide_last_24h"] / category_baseline_24h
+    ).fillna(0.0)
+
+    df["category_surge_score"] = _minmax_pandas_series(category_surge_raw.clip(0, 4))
+    df["district_surge_score"] = _minmax_pandas_series(district_surge_raw.clip(0, 4))
+    df["short_term_surge_score"] = (
+        0.55 * df["category_surge_score"]
+        + 0.30 * df["district_surge_score"]
+        + 0.15 * _minmax_pandas_series(category_citywide_surge_raw.clip(0, 4))
     ).clip(0, 1)
 
     df["severity_pressure_interaction"] = (
         pd.to_numeric(df["category_severity_score"], errors="coerce").fillna(0.35)
-        * df["recent_pressure_score"]
+        * (
+            0.65 * df["recent_pressure_score"]
+            + 0.35 * df["short_term_surge_score"]
+        )
     ).clip(0, 1)
 
     return df

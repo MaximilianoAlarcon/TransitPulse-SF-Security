@@ -33,7 +33,7 @@ Optional env vars:
     RISK_ML_TEST_SIZE=0.2
     RISK_ML_MIN_ROWS=200
     MODEL_DIR=models
-    RISK_CLASSIFIER_MODEL_NAME=risk_classifier_random_forest_v2
+    RISK_CLASSIFIER_MODEL_NAME=risk_classifier_random_forest_v3
     MODEL_S3_PREFIX=models
 """
 
@@ -75,7 +75,7 @@ BASE_DIR = Path(__file__).resolve().parent
 MODEL_DIR = Path(os.environ.get("MODEL_DIR", BASE_DIR / "models"))
 RISK_CLASSIFIER_MODEL_NAME = os.environ.get(
     "RISK_CLASSIFIER_MODEL_NAME",
-    "risk_classifier_random_forest_v2",
+    "risk_classifier_random_forest_v3",
 )
 
 DEFAULT_RISK_ML_LOOKBACK_DAYS = int(os.environ.get("RISK_ML_LOOKBACK_DAYS", "180"))
@@ -109,6 +109,9 @@ RISK_DERIVED_NUMERIC_FEATURES = [
     "district_activity_share_24h",
     "category_activity_share_24h",
     "recent_pressure_score",
+    "short_term_surge_score",
+    "category_surge_score",
+    "district_surge_score",
     "severity_pressure_interaction",
 ]
 
@@ -293,9 +296,11 @@ def is_night_hour(hour: Any) -> bool:
 
 def add_risk_derived_features(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Add inference-safe features that make the model more sensitive to local context.
-    These are derived only from available input features, so they can be reproduced
-    at prediction time without peeking into the future.
+    Add inference-safe features for the V3 risk classifier.
+
+    V3 is designed to be more dynamic than V2. It keeps severity/context,
+    but it gives more signal to short-term change versus the district/category
+    baseline instead of rewarding stable historical patterns.
     """
     df = df.copy()
 
@@ -338,21 +343,53 @@ def add_risk_derived_features(df: pd.DataFrame) -> pd.DataFrame:
         df["incidents_last_24h"] / district_total_last_24h
     ).fillna(0.0)
 
-    # Bounded pressure proxy. This helps separate districts that share the same category.
+    # Dynamic short-term pressure: 1h and 3h dominate; long-term history is only context.
     df["recent_pressure_score"] = (
-        0.45 * minmax_series(df["incidents_last_1h"])
-        + 0.25 * minmax_series(df["incidents_last_3h"])
-        + 0.20 * minmax_series(df["incidents_last_24h"])
-        + 0.10 * minmax_series(df["district_incidents_last_24h"])
+        0.62 * minmax_series(df["incidents_last_1h"])
+        + 0.28 * minmax_series(df["incidents_last_3h"])
+        + 0.10 * minmax_series(df["incidents_last_6h"])
+    ).clip(0, 1)
+
+    # Baselines by district/category/hour make the model react to "unusual for this place/time"
+    # instead of always rewarding the same stable district/category pairs.
+    baseline_keys = ["police_district", "incident_category", "hour_of_day"]
+    district_hour_keys = ["police_district", "hour_of_day"]
+    category_hour_keys = ["incident_category", "hour_of_day"]
+
+    baseline_3h = df.groupby(baseline_keys)["incidents_last_3h"].transform("mean").replace(0, pd.NA)
+    baseline_24h = df.groupby(baseline_keys)["incidents_last_24h"].transform("mean").replace(0, pd.NA)
+    district_baseline_24h = df.groupby(district_hour_keys)["district_incidents_last_24h"].transform("mean").replace(0, pd.NA)
+    category_baseline_24h = df.groupby(category_hour_keys)["category_citywide_last_24h"].transform("mean").replace(0, pd.NA)
+
+    category_surge_raw = (
+        (df["incidents_last_3h"] / baseline_3h).fillna(0.0)
+        + (df["incidents_last_24h"] / baseline_24h).fillna(0.0)
+    ) / 2.0
+    district_surge_raw = (
+        df["district_incidents_last_24h"] / district_baseline_24h
+    ).fillna(0.0)
+    category_citywide_surge_raw = (
+        df["category_citywide_last_24h"] / category_baseline_24h
+    ).fillna(0.0)
+
+    # Cap ratios before min-max so a single extreme outlier does not dominate training.
+    df["category_surge_score"] = minmax_series(category_surge_raw.clip(0, 4))
+    df["district_surge_score"] = minmax_series(district_surge_raw.clip(0, 4))
+    df["short_term_surge_score"] = (
+        0.55 * df["category_surge_score"]
+        + 0.30 * df["district_surge_score"]
+        + 0.15 * minmax_series(category_citywide_surge_raw.clip(0, 4))
     ).clip(0, 1)
 
     df["severity_pressure_interaction"] = (
         pd.to_numeric(df["category_severity_score"], errors="coerce").fillna(0.35)
-        * df["recent_pressure_score"]
+        * (
+            0.65 * df["recent_pressure_score"]
+            + 0.35 * df["short_term_surge_score"]
+        )
     ).clip(0, 1)
 
     return df
-
 
 def minmax_series(series: pd.Series) -> pd.Series:
     numeric = pd.to_numeric(series, errors="coerce").fillna(0.0)
@@ -364,11 +401,11 @@ def minmax_series(series: pd.Series) -> pd.Series:
 
 
 def assign_risk_level(score: float) -> str:
-    if score >= 0.30:
+    if score >= 0.28:
         return "Very High"
-    if score >= 0.22:
+    if score >= 0.20:
         return "High"
-    if score >= 0.15:
+    if score >= 0.12:
         return "Medium"
     return "Low"
 
@@ -379,9 +416,8 @@ def add_risk_targets(df: pd.DataFrame) -> pd.DataFrame:
     next_hour_incidents_norm = minmax_series(df["next_hour_incidents"])
     last_1h_norm = minmax_series(df["incidents_last_1h"])
     last_3h_norm = minmax_series(df["incidents_last_3h"])
+    last_6h_norm = minmax_series(df["incidents_last_6h"])
     last_24h_norm = minmax_series(df["incidents_last_24h"])
-    district_24h_norm = minmax_series(df["district_incidents_last_24h"])
-    category_citywide_24h_norm = minmax_series(df["category_citywide_last_24h"])
     delay_norm = minmax_series(df["avg_report_delay_minutes_24h"])
 
     open_pressure = pd.to_numeric(df["open_active_ratio_24h"], errors="coerce").fillna(0.0).clip(0, 1)
@@ -389,21 +425,27 @@ def add_risk_targets(df: pd.DataFrame) -> pd.DataFrame:
     severity = pd.to_numeric(df["category_severity_score"], errors="coerce").fillna(0.35).clip(0, 1)
     night = pd.to_numeric(df["is_night_hour"], errors="coerce").fillna(0.0).clip(0, 1)
     recent_pressure = pd.to_numeric(df["recent_pressure_score"], errors="coerce").fillna(0.0).clip(0, 1)
+    short_term_surge = pd.to_numeric(df["short_term_surge_score"], errors="coerce").fillna(0.0).clip(0, 1)
+    category_surge = pd.to_numeric(df["category_surge_score"], errors="coerce").fillna(0.0).clip(0, 1)
+    district_surge = pd.to_numeric(df["district_surge_score"], errors="coerce").fillna(0.0).clip(0, 1)
     severity_pressure = pd.to_numeric(df["severity_pressure_interaction"], errors="coerce").fillna(0.0).clip(0, 1)
 
     # Product-oriented synthetic risk score until human labels exist.
-    # V2 intentionally reduces pure category severity and increases local activity/pressure.
+    # V3 prioritizes dynamic short-term change versus local baseline.
+    # Long-term district/category history is intentionally reduced so the map can change by hour.
     df[RISK_SCORE_TARGET_COLUMN] = (
-        0.28 * next_hour_incidents_norm
-        + 0.16 * last_1h_norm
-        + 0.12 * last_3h_norm
-        + 0.12 * last_24h_norm
-        + 0.09 * district_24h_norm
-        + 0.05 * category_citywide_24h_norm
-        + 0.06 * severity
-        + 0.06 * recent_pressure
-        + 0.03 * severity_pressure
-        + 0.02 * open_pressure
+        0.30 * next_hour_incidents_norm
+        + 0.18 * last_1h_norm
+        + 0.14 * last_3h_norm
+        + 0.07 * last_6h_norm
+        + 0.05 * last_24h_norm
+        + 0.12 * short_term_surge
+        + 0.05 * category_surge
+        + 0.03 * district_surge
+        + 0.025 * severity
+        + 0.025 * recent_pressure
+        + 0.015 * severity_pressure
+        + 0.015 * open_pressure
         + 0.005 * delay_norm
         + 0.005 * night
         + 0.005 * (1.0 - filed_online_ratio)
@@ -627,7 +669,7 @@ def train_risk_classifier_model(rows: list[dict[str, Any]], test_size: float, mi
     )
 
     model_bundle = {
-        "model_type": "RiskClassifierRandomForestV2",
+        "model_type": "RiskClassifierRandomForestV3",
         "classifier": classifier,
         "regressor": regressor,
         "feature_columns": feature_columns,
@@ -638,13 +680,13 @@ def train_risk_classifier_model(rows: list[dict[str, Any]], test_size: float, mi
         "risk_level_order": RISK_LEVEL_ORDER,
         "risk_level_to_int": RISK_LEVEL_TO_INT,
         "int_to_risk_level": INT_TO_RISK_LEVEL,
-        "target_strategy": "synthetic_next_hour_observed_plus_severity_pressure",
+        "target_strategy": "synthetic_next_hour_observed_plus_dynamic_surge",
         "score_formula": (
-            "0.28*next_hour_incidents_norm + 0.16*last_1h_norm + "
-            "0.12*last_3h_norm + 0.12*last_24h_norm + "
-            "0.09*district_24h_norm + 0.05*category_citywide_24h_norm + "
-            "0.06*category_severity + 0.06*recent_pressure + "
-            "0.03*severity_pressure_interaction + 0.02*open_pressure + "
+            "0.30*next_hour_incidents_norm + 0.18*last_1h_norm + "
+            "0.14*last_3h_norm + 0.07*last_6h_norm + 0.05*last_24h_norm + "
+            "0.12*short_term_surge + 0.05*category_surge + 0.03*district_surge + "
+            "0.025*category_severity + 0.025*recent_pressure + "
+            "0.015*severity_pressure_interaction + 0.015*open_pressure + "
             "0.005*delay_norm + 0.005*night + 0.005*(1-filed_online_ratio)"
         ),
     }
@@ -662,7 +704,7 @@ def train_risk_classifier_model(rows: list[dict[str, Any]], test_size: float, mi
     metrics = {
         "status": "ok",
         "model_name": RISK_CLASSIFIER_MODEL_NAME,
-        "model_type": "RiskClassifierRandomForestV2",
+        "model_type": "RiskClassifierRandomForestV3",
         "generated_at": generated_at.isoformat(),
         "model_path": str(model_path),
         "metrics_path": str(metrics_path),
