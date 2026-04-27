@@ -510,7 +510,7 @@ def build_volume_forecast_geojson(
 
 RISK_CLASSIFIER_MODEL_NAME = os.environ.get(
     "RISK_CLASSIFIER_MODEL_NAME",
-    "risk_classifier_random_forest_v1",
+    "risk_classifier_random_forest_v2",
 )
 
 RISK_MODEL_CACHE: dict[str, Any] = {
@@ -518,7 +518,7 @@ RISK_MODEL_CACHE: dict[str, Any] = {
     "source": None,
 }
 
-RISK_NUMERIC_FEATURES = [
+RISK_BASE_NUMERIC_FEATURES = [
     "hour_of_day",
     "month_of_year",
     "incidents_last_1h",
@@ -530,6 +530,20 @@ RISK_NUMERIC_FEATURES = [
     "filed_online_ratio_24h",
     "avg_report_delay_minutes_24h",
 ]
+
+RISK_DERIVED_NUMERIC_FEATURES = [
+    "category_severity_score",
+    "is_night_hour",
+    "district_incidents_last_24h",
+    "district_incidents_last_7d",
+    "category_citywide_last_24h",
+    "district_activity_share_24h",
+    "category_activity_share_24h",
+    "recent_pressure_score",
+    "severity_pressure_interaction",
+]
+
+RISK_NUMERIC_FEATURES = RISK_BASE_NUMERIC_FEATURES + RISK_DERIVED_NUMERIC_FEATURES
 
 RISK_CATEGORICAL_FEATURES = [
     "police_district",
@@ -619,11 +633,11 @@ def load_risk_model() -> tuple[Any, str]:
 
 
 def risk_level_from_score(score: float) -> str:
-    if score >= 0.75:
-        return "Very High"
-    if score >= 0.55:
-        return "High"
     if score >= 0.30:
+        return "Very High"
+    if score >= 0.22:
+        return "High"
+    if score >= 0.15:
         return "Medium"
     return "Low"
 
@@ -639,6 +653,112 @@ def risk_level_sort_value(level: Any) -> int:
     if normalized == "Low":
         return 1
     return 0
+
+
+
+def risk_category_severity_score(category: Any) -> float:
+    normalized = str(category or "").strip().lower()
+
+    very_high_keywords = ["homicide", "sex offense", "weapons", "weapon"]
+    high_keywords = [
+        "assault",
+        "robbery",
+        "burglary",
+        "arson",
+        "offences against the family",
+        "offenses against the family",
+    ]
+    medium_keywords = [
+        "motor vehicle theft",
+        "larceny",
+        "theft",
+        "stolen property",
+        "fraud",
+        "malicious mischief",
+        "vandalism",
+        "forgery",
+        "embezzlement",
+    ]
+    low_keywords = ["drug", "disorderly", "liquor", "gambling", "prostitution"]
+
+    if any(keyword in normalized for keyword in very_high_keywords):
+        return 1.0
+    if any(keyword in normalized for keyword in high_keywords):
+        return 0.82
+    if any(keyword in normalized for keyword in medium_keywords):
+        return 0.58
+    if any(keyword in normalized for keyword in low_keywords):
+        return 0.42
+    return 0.35
+
+
+def risk_is_night_hour(hour: Any) -> bool:
+    try:
+        h = int(hour)
+    except (TypeError, ValueError):
+        return False
+    return h >= 22 or h <= 5
+
+
+def _minmax_pandas_series(series: Any) -> Any:
+    import pandas as pd
+
+    numeric = pd.to_numeric(series, errors="coerce").fillna(0.0)
+    min_value = float(numeric.min())
+    max_value = float(numeric.max())
+    if abs(min_value - max_value) < 1e-12:
+        return pd.Series([0.0] * len(numeric), index=numeric.index)
+    return (numeric - min_value) / (max_value - min_value)
+
+
+def add_risk_derived_features_to_df(df: Any) -> Any:
+    import pandas as pd
+
+    df = df.copy()
+
+    for column in RISK_BASE_NUMERIC_FEATURES:
+        df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0.0)
+
+    for column in RISK_CATEGORICAL_FEATURES:
+        df[column] = df[column].fillna("Unknown").astype(str)
+
+    df["category_severity_score"] = df["incident_category"].map(risk_category_severity_score)
+    df["is_night_hour"] = df["hour_of_day"].map(risk_is_night_hour).astype(int)
+
+    df["district_incidents_last_24h"] = (
+        df.groupby(["feature_timestamp", "police_district"])["incidents_last_24h"].transform("sum")
+    )
+    df["district_incidents_last_7d"] = (
+        df.groupby(["feature_timestamp", "police_district"])["incidents_last_7d"].transform("sum")
+    )
+    df["category_citywide_last_24h"] = (
+        df.groupby(["feature_timestamp", "incident_category"])["incidents_last_24h"].transform("sum")
+    )
+
+    city_incidents_last_24h = df.groupby("feature_timestamp")["incidents_last_24h"].transform("sum")
+    district_total_last_24h = df["district_incidents_last_24h"].replace(0, pd.NA)
+    city_total_last_24h = city_incidents_last_24h.replace(0, pd.NA)
+
+    df["district_activity_share_24h"] = (
+        df["district_incidents_last_24h"] / city_total_last_24h
+    ).fillna(0.0)
+    df["category_activity_share_24h"] = (
+        df["incidents_last_24h"] / district_total_last_24h
+    ).fillna(0.0)
+
+    df["recent_pressure_score"] = (
+        0.45 * _minmax_pandas_series(df["incidents_last_1h"])
+        + 0.25 * _minmax_pandas_series(df["incidents_last_3h"])
+        + 0.20 * _minmax_pandas_series(df["incidents_last_24h"])
+        + 0.10 * _minmax_pandas_series(df["district_incidents_last_24h"])
+    ).clip(0, 1)
+
+    df["severity_pressure_interaction"] = (
+        pd.to_numeric(df["category_severity_score"], errors="coerce").fillna(0.35)
+        * df["recent_pressure_score"]
+    ).clip(0, 1)
+
+    return df
 
 
 def predict_risk_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
@@ -664,6 +784,7 @@ def predict_risk_from_rows(rows: list[dict[str, Any]]) -> dict[str, Any]:
         ) from exc
 
     df = pd.DataFrame(rows)
+    df = add_risk_derived_features_to_df(df)
 
     numeric_features = list(model_bundle.get("numeric_features") or RISK_NUMERIC_FEATURES)
     categorical_features = list(model_bundle.get("categorical_features") or RISK_CATEGORICAL_FEATURES)
