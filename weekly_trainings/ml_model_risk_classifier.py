@@ -287,11 +287,11 @@ def minmax_series(series: pd.Series) -> pd.Series:
 
 
 def assign_risk_level(score: float) -> str:
-    if score >= 0.75:
-        return "Very High"
-    if score >= 0.55:
-        return "High"
     if score >= 0.30:
+        return "Very High"
+    if score >= 0.22:
+        return "High"
+    if score >= 0.15:
         return "Medium"
     return "Low"
 
