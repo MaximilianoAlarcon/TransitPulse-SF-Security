@@ -934,6 +934,36 @@ def parse_sf_target_timestamp(raw_value: str) -> datetime | None:
     return parsed
 
 
+def apply_projection_timestamp_to_rows(
+    rows: list[dict[str, Any]],
+    projection_timestamp: datetime | None,
+) -> list[dict[str, Any]]:
+    """
+    Socrata/DataSF timestamps are treated as America/Los_Angeles local time.
+    The volume model receives temporal features explicitly, so custom projection
+    times must update hour/day/month before inference.
+
+    For a requested projection time, feature_timestamp is set to one hour before
+    so predict_volume_from_rows reports forecast_for as the requested time.
+    Rolling-window features still come from the latest available feature context.
+    """
+    if projection_timestamp is None:
+        return rows
+
+    feature_timestamp = projection_timestamp - timedelta(hours=1)
+    projected_rows: list[dict[str, Any]] = []
+
+    for row in rows:
+        projected_row = dict(row)
+        projected_row["feature_timestamp"] = feature_timestamp
+        projected_row["hour_of_day"] = projection_timestamp.hour
+        projected_row["day_of_week"] = projection_timestamp.strftime("%A")
+        projected_row["month_of_year"] = projection_timestamp.month
+        projected_rows.append(projected_row)
+
+    return projected_rows
+
+
 
 @app.route("/admin/ml/volume/model-info", methods=["GET"])
 @require_admin_token
@@ -1063,12 +1093,17 @@ def api_dashboard_ml_volume_polygons():
         ), 400
 
     try:
+        # If target_timestamp is provided, use the latest rolling feature context
+        # and override only the temporal features to simulate the selected SF time.
+        # If target_timestamp is latest/None, preserve the original latest-feature behavior.
         rows = fetch_latest_volume_features(
             limit=None,
-            target_timestamp=target_timestamp,
+            target_timestamp=None if target_timestamp else None,
             district=district_filter,
             category=category_filter,
         )
+
+        rows = apply_projection_timestamp_to_rows(rows, target_timestamp)
 
         prediction_result = predict_volume_from_rows(rows)
         forecast_geojson = build_volume_forecast_geojson(

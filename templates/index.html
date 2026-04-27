@@ -164,7 +164,21 @@
                 <strong>Forecast layer</strong>
                 <span>Load ML projections only when you want to inspect forecast polygons.</span>
               </div>
-              <button id="load-volume-projections" class="btn btn-sm btn-outline-light w-100 mt-2" type="button">
+
+              <div class="volume-projection-controls mt-3">
+                <label class="form-label" for="volume-projection-time">Projection time (SF)</label>
+                <input
+                  id="volume-projection-time"
+                  class="form-control app-control"
+                  type="datetime-local"
+                  aria-describedby="volume-projection-time-help"
+                >
+                <div id="volume-projection-time-help" class="small-muted mt-1">
+                  Defaults to the current time in San Francisco.
+                </div>
+              </div>
+
+              <button id="load-volume-projections" class="btn btn-sm btn-outline-light w-100 mt-3" type="button">
                 Load volume projections
               </button>
               <div id="volume-projection-status" class="small-muted mt-2">

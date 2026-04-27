@@ -714,3 +714,58 @@ body {
   border-color: rgba(255,255,255,0.12);
   margin: 8px 0;
 }
+
+
+/* Volume projections */
+.volume-projection-controls .form-label {
+  margin-bottom: 6px;
+}
+
+.app-control {
+  min-height: 46px;
+  background-color: rgba(255,255,255,0.05);
+  color: var(--text);
+  border: 1px solid rgba(255,255,255,0.08);
+}
+
+.app-control:focus {
+  background-color: rgba(255,255,255,0.07);
+  color: var(--text);
+  border-color: rgba(140,200,255,0.45);
+  box-shadow: 0 0 0 0.2rem rgba(140,200,255,0.12);
+}
+
+.app-control::-webkit-calendar-picker-indicator {
+  filter: invert(1);
+  opacity: 0.75;
+}
+
+.volume-projection-status-ok {
+  color: #b9f4d3 !important;
+}
+
+.volume-projection-status-error {
+  color: #ffd0d0 !important;
+}
+
+.volume-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.volume-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.82rem;
+}
+
+.volume-legend-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  display: inline-block;
+}

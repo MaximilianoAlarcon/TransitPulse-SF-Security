@@ -572,6 +572,71 @@ function volumeProjectionPopupHtml(properties = {}) {
   `;
 }
 
+function getSfDateTimeParts(date = new Date()) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'America/Los_Angeles',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false
+  }).formatToParts(date);
+
+  const get = (type) => parts.find((part) => part.type === type)?.value;
+
+  return {
+    year: get('year'),
+    month: get('month'),
+    day: get('day'),
+    hour: get('hour') === '24' ? '00' : get('hour'),
+    minute: get('minute')
+  };
+}
+
+function getCurrentSfDateTimeLocalValue() {
+  const parts = getSfDateTimeParts(new Date());
+  return `${parts.year}-${parts.month}-${parts.day}T${parts.hour}:${parts.minute}`;
+}
+
+function initializeVolumeProjectionTimeInput() {
+  const input = document.getElementById('volume-projection-time');
+  if (!input) return;
+
+  if (!input.value) {
+    input.value = getCurrentSfDateTimeLocalValue();
+  }
+}
+
+function getVolumeProjectionTargetTimestamp() {
+  const input = document.getElementById('volume-projection-time');
+
+  if (!input || !input.value) {
+    return getCurrentSfDateTimeLocalValue();
+  }
+
+  return input.value;
+}
+
+function formatProjectionTimestampLabel(value) {
+  if (!value || value === 'latest') return 'latest available forecast';
+
+  const safeValue = value.length === 16 ? `${value}:00` : value;
+  const parsed = new Date(safeValue);
+
+  if (Number.isNaN(parsed.getTime())) {
+    return `${value} SF`;
+  }
+
+  return parsed.toLocaleString([], {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit'
+  }) + ' SF';
+}
+
 function updateVolumeProjectionStatus(text, isError = false) {
   const el = document.getElementById('volume-projection-status');
   if (!el) return;
@@ -601,13 +666,29 @@ function renderVolumeProjectionSummary(payload) {
       <strong>Model rows</strong>
       <span>${rows} district/category projections used for this layer.</span>
     </div>
+    <div class="roadmap-item">
+      <strong>Projection time</strong>
+      <span>${formatProjectionTimestampLabel(payload?.filters?.target_timestamp)}</span>
+    </div>
     <div class="volume-legend">
       <span class="volume-legend-item"><span class="volume-legend-swatch" style="background:#ff6b6b"></span>High</span>
       <span class="volume-legend-item"><span class="volume-legend-swatch" style="background:#f7b267"></span>Medium</span>
       <span class="volume-legend-item"><span class="volume-legend-swatch" style="background:#7dd3a7"></span>Low</span>
       <span class="volume-legend-item"><span class="volume-legend-swatch" style="background:#1f2937"></span>None</span>
     </div>
-    <button id="load-volume-projections" class="btn btn-sm btn-outline-light w-100 mt-2" type="button">
+
+    <div class="volume-projection-controls mt-3">
+      <label class="form-label" for="volume-projection-time">Projection time (SF)</label>
+      <input
+        id="volume-projection-time"
+        class="form-control app-control"
+        type="datetime-local"
+        value="${payload?.filters?.target_timestamp && payload.filters.target_timestamp !== 'latest' ? payload.filters.target_timestamp.slice(0, 16) : getCurrentSfDateTimeLocalValue()}"
+      >
+      <div class="small-muted mt-1">All projection times are interpreted as San Francisco local time.</div>
+    </div>
+
+    <button id="load-volume-projections" class="btn btn-sm btn-outline-light w-100 mt-3" type="button">
       Reload volume projections
     </button>
     <div id="volume-projection-status" class="small-muted mt-2">${currentStatus || 'Loaded.'}</div>
@@ -718,8 +799,12 @@ async function loadVolumeProjections() {
   updateVolumeProjectionStatus('Loading forecast polygons…');
 
   try {
+    initializeVolumeProjectionTimeInput();
+
+    const targetTimestamp = getVolumeProjectionTargetTimestamp();
+
     const payload = await apiGet('/api/dashboard/ml-volume-polygons', {
-      target_timestamp: 'latest',
+      target_timestamp: targetTimestamp,
       district: 'all',
       category: 'all'
     });
@@ -950,6 +1035,7 @@ function bindEvents() {
     refreshDashboard();
   });
 
+  initializeVolumeProjectionTimeInput();
   bindVolumeProjectionButton();
 
   document.getElementById('btn-center-sf')?.addEventListener('click', () => {
