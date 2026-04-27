@@ -1014,7 +1014,23 @@ def admin_etl_run():
         return jsonify({"status": "error", "message": str(exc)}), 400
 
 
-@app.route("/api/dashboard/ml-volume-polygons")
+SF_TZ = ZoneInfo("America/Los_Angeles")
+
+def parse_sf_target_timestamp(raw_value: str) -> datetime | None:
+    raw_value = (raw_value or "").strip()
+
+    if not raw_value or raw_value.lower() == "latest":
+        return None
+
+    parsed = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+
+    if parsed.tzinfo is not None:
+        return parsed.astimezone(SF_TZ).replace(tzinfo=None)
+
+    return parsed
+
+
+@app.route("/api/dashboard/ml-volume-polygons", methods=["GET"])
 def api_dashboard_ml_volume_polygons():
     category = (request.args.get("category") or "all").strip()
     district = (request.args.get("district") or "all").strip()
@@ -1022,21 +1038,21 @@ def api_dashboard_ml_volume_polygons():
     category_filter = None if category.lower() == "all" else category
     district_filter = None if district.lower() == "all" else district
 
-    target_timestamp = None
-    raw_target_timestamp = (request.args.get("target_timestamp") or "").strip()
+    raw_target_timestamp = (request.args.get("target_timestamp") or "latest").strip()
 
-    if raw_target_timestamp and raw_target_timestamp.lower() != "latest":
-        try:
-            target_timestamp = datetime.fromisoformat(
-                raw_target_timestamp.replace("Z", "+00:00")
-            ).replace(tzinfo=None)
-        except ValueError:
-            return jsonify(
-                {
-                    "status": "error",
-                    "message": "Invalid target_timestamp. Use ISO format, for example 2026-04-26T13:00:00.",
-                }
-            ), 400
+    try:
+        target_timestamp = parse_sf_target_timestamp(raw_target_timestamp)
+    except ValueError:
+        return jsonify(
+            {
+                "status": "error",
+                "message": (
+                    "Invalid target_timestamp. Use 'latest', a San Francisco local timestamp "
+                    "like 2026-04-26T13:00:00, or an ISO timestamp with timezone like "
+                    "2026-04-26T20:00:00Z."
+                ),
+            }
+        ), 400
 
     try:
         rows = fetch_latest_volume_features(
@@ -1058,7 +1074,12 @@ def api_dashboard_ml_volume_polygons():
                 "model_runtime_type": prediction_result.get("model_runtime_type"),
                 "model_source": prediction_result.get("model_source"),
                 "filters": {
-                    "target_timestamp": target_timestamp.isoformat() if target_timestamp else "latest",
+                    "target_timestamp": (
+                        target_timestamp.isoformat()
+                        if target_timestamp
+                        else "latest"
+                    ),
+                    "target_timezone": "America/Los_Angeles",
                     "district": district_filter or "all",
                     "category": category_filter or "all",
                 },
