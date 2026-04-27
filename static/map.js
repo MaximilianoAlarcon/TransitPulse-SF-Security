@@ -622,35 +622,67 @@ function normalizedRiskRatio(score, scale = {}) {
   return clamp01((numericScore - min) / (max - min));
 }
 
+function lerp(a, b, t) {
+  return a + (b - a) * clamp01(t);
+}
+
+function hexToRgb(hex) {
+  const value = String(hex || '').replace('#', '');
+
+  return {
+    r: parseInt(value.slice(0, 2), 16),
+    g: parseInt(value.slice(2, 4), 16),
+    b: parseInt(value.slice(4, 6), 16)
+  };
+}
+
+function rgbToHex(r, g, b) {
+  return `#${[r, g, b].map((value) =>
+    Math.round(value).toString(16).padStart(2, '0')
+  ).join('')}`;
+}
+
+function interpolateColor(colorA, colorB, t) {
+  const a = hexToRgb(colorA);
+  const b = hexToRgb(colorB);
+  const ratio = clamp01(t);
+
+  return rgbToHex(
+    lerp(a.r, b.r, ratio),
+    lerp(a.g, b.g, ratio),
+    lerp(a.b, b.b, ratio)
+  );
+}
+
+function riskVisualIntensity(score, scale = {}) {
+  return Math.round(normalizedRiskRatio(score, scale) * 100);
+}
+
 function riskProjectionColor(score, scale = {}) {
   const ratio = normalizedRiskRatio(score, scale);
 
-  if (ratio >= 0.86) return '#7f1d1d';
-  if (ratio >= 0.68) return '#dc2626';
-  if (ratio >= 0.48) return '#f97316';
-  if (ratio >= 0.26) return '#facc15';
-  return '#84cc16';
+  // Continuous analog gradient:
+  // green → yellow → orange → dark red.
+  if (ratio < 0.42) {
+    return interpolateColor('#84cc16', '#facc15', ratio / 0.42);
+  }
+
+  if (ratio < 0.72) {
+    return interpolateColor('#facc15', '#f97316', (ratio - 0.42) / 0.30);
+  }
+
+  return interpolateColor('#f97316', '#7f1d1d', (ratio - 0.72) / 0.28);
 }
 
 function riskProjectionOpacity(score, scale = {}) {
   const ratio = normalizedRiskRatio(score, scale);
-  return Math.max(0.28, Math.min(0.76, 0.28 + ratio * 0.44));
-}
-
-function riskVisualBucketLabel(score, scale = {}) {
-  const ratio = normalizedRiskRatio(score, scale);
-
-  if (ratio >= 0.86) return 'Highest visual band';
-  if (ratio >= 0.68) return 'High visual band';
-  if (ratio >= 0.48) return 'Elevated visual band';
-  if (ratio >= 0.26) return 'Moderate visual band';
-  return 'Lower visual band';
+  return Math.max(0.30, Math.min(0.78, 0.30 + ratio * 0.42));
 }
 
 function riskProjectionPopupHtml(properties = {}, visualScale = {}) {
   const categories = Array.isArray(properties.top_risk_categories) ? properties.top_risk_categories : [];
   const score = Number(properties.risk_score_max || 0);
-  const visualBand = riskVisualBucketLabel(score, visualScale);
+  const intensity = riskVisualIntensity(score, visualScale);
 
   const topCategoriesHtml = categories.length > 0
     ? categories.map((item) => {
@@ -661,8 +693,8 @@ function riskProjectionPopupHtml(properties = {}, visualScale = {}) {
   return `
     <div class="popup-card">
       <strong>${properties.police_district || 'Unknown district'}</strong><br>
-      <span>District risk: ${(properties.risk_level || 'Low').toUpperCase()}</span><br>
-      <span>Visual band: ${visualBand}</span><br>
+      <span>Relative district risk: ${(properties.risk_level || 'Low').toUpperCase()}</span><br>
+      <span>Relative intensity: ${intensity}%</span><br>
       <span>Max risk score: ${formatNumber(properties.risk_score_max || 0, 4)}</span><br>
       <span>Avg risk score: ${formatNumber(properties.risk_score_avg || 0, 4)}</span><br>
       <hr>
@@ -1011,7 +1043,7 @@ function renderRiskProjectionSummary(payload) {
       <span>${formatProjectionTimestampLabel(payload?.filters?.target_timestamp)}</span>
     </div>
     <div class="roadmap-item">
-      <strong>Visual scale</strong>
+      <strong>Continuous visual scale</strong>
       <span>P10 ${formatNumber(visualScale.p10 || 0, 4)} · P50 ${formatNumber(visualScale.p50 || 0, 4)} · P90 ${formatNumber(visualScale.p90 || 0, 4)}</span>
     </div>
     <div class="roadmap-item">
@@ -1019,11 +1051,10 @@ function renderRiskProjectionSummary(payload) {
       <span>Medium ${formatNumber(thresholds.medium || 0, 4)} · High ${formatNumber(thresholds.high || 0, 4)} · Very High ${formatNumber(thresholds.very_high || 0, 4)}</span>
     </div>
     <div class="risk-legend">
-      <span class="risk-legend-item"><span class="risk-legend-swatch" style="background:#7f1d1d"></span>Highest visual band</span>
-      <span class="risk-legend-item"><span class="risk-legend-swatch" style="background:#dc2626"></span>High</span>
-      <span class="risk-legend-item"><span class="risk-legend-swatch" style="background:#f97316"></span>Elevated</span>
-      <span class="risk-legend-item"><span class="risk-legend-swatch" style="background:#facc15"></span>Moderate</span>
-      <span class="risk-legend-item"><span class="risk-legend-swatch" style="background:#84cc16"></span>Lower</span>
+      <span class="risk-legend-item"><span class="risk-legend-swatch" style="background:#84cc16"></span>Lower intensity</span>
+      <span class="risk-legend-item"><span class="risk-legend-swatch" style="background:#facc15"></span>Mid intensity</span>
+      <span class="risk-legend-item"><span class="risk-legend-swatch" style="background:#f97316"></span>Elevated intensity</span>
+      <span class="risk-legend-item"><span class="risk-legend-swatch" style="background:#7f1d1d"></span>Higher intensity</span>
     </div>
 
     <div class="risk-projection-controls mt-3">
@@ -1071,7 +1102,8 @@ function renderRiskForecastPolygons(payload) {
     onEachFeature: (feature, layer) => {
       const properties = feature.properties || {};
       const score = formatNumber(properties.risk_score_max || 0, 4);
-      const label = `${properties.police_district || 'District'} · ${properties.risk_level || 'Risk'} · ${score}`;
+      const intensity = riskVisualIntensity(Number(properties.risk_score_max || 0), visualScale);
+      const label = `${properties.police_district || 'District'} · ${intensity}% · ${score}`;
 
       layer.bindPopup(riskProjectionPopupHtml(properties, visualScale));
       layer.bindTooltip(label, {
@@ -1107,7 +1139,7 @@ function renderRiskForecastPolygons(payload) {
 
   const caption = document.getElementById('map-caption');
   if (caption) {
-    caption.textContent = `ML risk projections · robust visual scale · max score ${formatNumber(maxRiskScore, 4)} · ${formatNumber(features.length, 0)} districts`;
+    caption.textContent = `ML risk projections · continuous intensity scale · max score ${formatNumber(maxRiskScore, 4)} · ${formatNumber(features.length, 0)} districts`;
   }
 
   renderRiskProjectionSummary(payload);
