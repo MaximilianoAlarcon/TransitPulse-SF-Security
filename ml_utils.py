@@ -649,37 +649,62 @@ def percentile_from_sorted(sorted_values: list[float], percentile: float) -> flo
     return float(sorted_values[index])
 
 
-def build_risk_score_thresholds(scores: list[float]) -> dict[str, float]:
-    """
-    Build dynamic thresholds from the current prediction batch.
-
-    The V2 risk model is intentionally contextual and tends to produce compressed
-    scores. Dynamic thresholds make the dashboard show relative risk differences
-    without pretending these are absolute crime probabilities.
-    """
-    clean_scores = sorted(
+def clean_risk_scores(scores: list[float]) -> list[float]:
+    return sorted(
         max(0.0, min(1.0, float(score)))
         for score in scores
         if score is not None
     )
+
+
+def build_risk_score_thresholds(scores: list[float]) -> dict[str, Any]:
+    """
+    Build dynamic thresholds from the current prediction batch.
+
+    Important:
+    risk_classifier_random_forest_v2 can produce compressed and repeated scores.
+    If many districts share the same score, simple p50/p75/p90 thresholds can
+    collapse to the same value. To avoid making every district Low, this function
+    also calculates unique-score thresholds and exposes min/max/unique_count.
+    """
+    clean_scores = clean_risk_scores(scores)
 
     if not clean_scores:
         return {
             "medium": 0.0,
             "high": 0.0,
             "very_high": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "unique_count": 0,
+        }
+
+    unique_scores = sorted(set(clean_scores))
+
+    if len(unique_scores) == 1:
+        only_score = float(unique_scores[0])
+        return {
+            "medium": only_score,
+            "high": only_score,
+            "very_high": only_score,
+            "min": only_score,
+            "max": only_score,
+            "unique_count": 1,
         }
 
     return {
-        "medium": percentile_from_sorted(clean_scores, 0.50),
-        "high": percentile_from_sorted(clean_scores, 0.75),
-        "very_high": percentile_from_sorted(clean_scores, 0.90),
+        "medium": percentile_from_sorted(unique_scores, 0.50),
+        "high": percentile_from_sorted(unique_scores, 0.75),
+        "very_high": percentile_from_sorted(unique_scores, 0.90),
+        "min": float(clean_scores[0]),
+        "max": float(clean_scores[-1]),
+        "unique_count": len(unique_scores),
     }
 
 
 def risk_level_from_score(
     score: float,
-    thresholds: dict[str, float] | None = None,
+    thresholds: dict[str, Any] | None = None,
 ) -> str:
     """
     Convert a risk score into a display level.
@@ -690,13 +715,16 @@ def risk_level_from_score(
     score_value = max(0.0, min(1.0, float(score or 0)))
 
     if thresholds:
-        very_high = float(thresholds.get("very_high", 0.0))
-        high = float(thresholds.get("high", 0.0))
-        medium = float(thresholds.get("medium", 0.0))
+        unique_count = int(thresholds.get("unique_count", 0) or 0)
+        min_score = float(thresholds.get("min", 0.0) or 0.0)
+        max_score = float(thresholds.get("max", 0.0) or 0.0)
 
-        # If all scores are identical, avoid labeling everything Very High.
-        if abs(very_high - medium) < 1e-12:
+        if unique_count <= 1 or abs(max_score - min_score) < 1e-12:
             return "Low"
+
+        very_high = float(thresholds.get("very_high", max_score) or 0.0)
+        high = float(thresholds.get("high", very_high) or 0.0)
+        medium = float(thresholds.get("medium", high) or 0.0)
 
         if score_value >= very_high:
             return "Very High"
@@ -710,6 +738,53 @@ def risk_level_from_score(
     if score_value >= 0.22:
         return "High"
     if score_value >= 0.15:
+        return "Medium"
+    return "Low"
+
+
+def district_risk_level_from_rank(
+    score: float,
+    all_scores: list[float],
+) -> str:
+    """
+    Rank-aware district-level classification.
+
+    This is stricter than raw thresholds and is designed for map display:
+    - If every district has the same score, everything is Low.
+    - If one district is clearly the highest, it becomes Very High.
+    - If there are few unique values, the lower repeated value stays Low instead
+      of being promoted to Medium only because percentiles collapsed.
+    """
+    clean_scores = clean_risk_scores(all_scores)
+    unique_scores = sorted(set(clean_scores))
+
+    if not unique_scores:
+        return "Low"
+
+    score_value = max(0.0, min(1.0, float(score or 0)))
+
+    if len(unique_scores) == 1:
+        return "Low"
+
+    rank_from_top = unique_scores[::-1].index(score_value) + 1 if score_value in unique_scores else len(unique_scores)
+
+    if len(unique_scores) == 2:
+        return "Very High" if rank_from_top == 1 else "Low"
+
+    if len(unique_scores) == 3:
+        if rank_from_top == 1:
+            return "Very High"
+        if rank_from_top == 2:
+            return "Medium"
+        return "Low"
+
+    percentile_position = (unique_scores.index(score_value) + 1) / len(unique_scores)
+
+    if percentile_position >= 0.90:
+        return "Very High"
+    if percentile_position >= 0.75:
+        return "High"
+    if percentile_position >= 0.50:
         return "Medium"
     return "Low"
 
@@ -995,12 +1070,14 @@ def build_risk_forecast_geojson(
         entry["risk_score_max"] = round(entry["risk_score_max"], 4)
         entry["risk_level_probability_max"] = round(entry["risk_level_probability_max"], 4)
 
-    district_score_thresholds = build_risk_score_thresholds(
-        [entry["risk_score_max"] for entry in by_district.values()]
-    )
+    district_scores = [entry["risk_score_max"] for entry in by_district.values()]
+    district_score_thresholds = build_risk_score_thresholds(district_scores)
 
     for entry in by_district.values():
-        entry["risk_level"] = risk_level_from_score(entry["risk_score_max"], district_score_thresholds)
+        entry["risk_level"] = district_risk_level_from_rank(
+            entry["risk_score_max"],
+            district_scores,
+        )
         entry["categories"] = sorted(
             entry["categories"],
             key=lambda row: row["risk_score"],
@@ -1069,7 +1146,7 @@ def build_risk_forecast_geojson(
             for key, value in district_score_thresholds.items()
         },
         "level_strategy": "dynamic_district_score_percentiles",
-        "level_source": "district_risk_score_max",
+        "level_source": "district_risk_score_max_rank",
         "category_level_policy": "top_risk_categories are ranked by risk_score only; they do not define district risk_level",
     }
 
