@@ -35,13 +35,21 @@ MAX_TIMEOUT_SECONDS = 10800
 # Each step runs sequentially. If one fails, the pipeline stops.
 TRAINING_STEPS: list[dict[str, Any]] = [
     {
+        "name": "ml_model_volume",
+        "script": "ml_model_volume.py",
+        "enabled": True,
+        "model_name": "volume_random_forest_v1",
+        # Optional per-step timeout. If None, uses WEEKLY_TRAINING_TIMEOUT_SECONDS.
+        "timeout_seconds": None,
+    },
+    {
         "name": "ml_model_risk_classifier",
         "script": "ml_model_risk_classifier.py",
         "enabled": True,
         "model_name": "risk_classifier_random_forest_v1",
         # Optional per-step timeout. If None, uses WEEKLY_TRAINING_TIMEOUT_SECONDS.
         "timeout_seconds": None,
-    }
+    },
 ]
 
 
