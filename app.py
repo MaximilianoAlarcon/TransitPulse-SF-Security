@@ -15,6 +15,7 @@ from flask import Flask, Response, jsonify, render_template, request
 from psycopg2.extras import RealDictCursor
 
 from utils import execute_query, execute_sql_file, get_db_connection
+from clustering import build_hotspot_geojson
 
 from zoneinfo import ZoneInfo
 
@@ -56,6 +57,9 @@ WINDOW_TO_DELTA = {
 
 SF_CENTER = {"lat": 37.7749, "lon": -122.4194}
 MAP_POINT_LIMIT = 600
+DEFAULT_HOTSPOT_EPS_METERS = int(os.environ.get("HOTSPOT_EPS_METERS", "250"))
+DEFAULT_HOTSPOT_MIN_SAMPLES = int(os.environ.get("HOTSPOT_MIN_SAMPLES", "8"))
+DEFAULT_HOTSPOT_MAX_POINTS = int(os.environ.get("HOTSPOT_MAX_POINTS", "12000"))
 
 
 CATEGORY_FILTER_VALUES = [
@@ -816,6 +820,33 @@ def api_dashboard_risk_signals():
         signals.sort(key=lambda item: (0 if item["label"].startswith("Avg report delay") else 1, item["label"]))
 
     return jsonify({"status": "ok", "signals": signals})
+
+
+@app.route("/api/dashboard/hotspots")
+def api_dashboard_hotspots():
+    filters = parse_filters()
+
+    eps_meters = request.args.get("eps_meters", DEFAULT_HOTSPOT_EPS_METERS)
+    min_samples = request.args.get("min_samples", DEFAULT_HOTSPOT_MIN_SAMPLES)
+    max_points = request.args.get("max_points", DEFAULT_HOTSPOT_MAX_POINTS)
+
+    try:
+        hotspot_geojson = build_hotspot_geojson(
+            get_db_connection,
+            start_dt=filters["start_dt"],
+            end_dt=filters["end_dt"],
+            district=filters["district"],
+            category=filters["category"],
+            category_filter_values=CATEGORY_FILTER_VALUES,
+            eps_meters=eps_meters,
+            min_samples=min_samples,
+            max_points=max_points,
+        )
+        hotspot_geojson["center"] = SF_CENTER
+        hotspot_geojson["window"] = filters["window"]
+        return jsonify(hotspot_geojson)
+    except Exception as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 500
 
 
 @app.route("/api/dashboard/map-points")
