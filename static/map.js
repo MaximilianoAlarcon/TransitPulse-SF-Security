@@ -1435,14 +1435,29 @@ function renderHotspots(payload) {
 
 async function refreshHotspotFilterOptions(selected = {}) {
   try {
+    const windowValue =
+      document.getElementById('hotspot-window')?.value ||
+      selected.window ||
+      '7d';
+
+    const currentDistrict =
+      document.getElementById('hotspot-district-filter')?.value ||
+      selected.district ||
+      'all';
+
+    const currentCategory =
+      document.getElementById('hotspot-category-filter')?.value ||
+      selected.category ||
+      'all';
+
     const payload = await apiGet('/api/dashboard/filters', {
-      window: document.getElementById('hotspot-window')?.value || selected.window || '7d',
+      window: windowValue,
       district: 'all',
       category: 'all'
     });
 
-    setSelectOptions('hotspot-district-filter', payload.districts, selected.district || 'all');
-    setSelectOptions('hotspot-category-filter', payload.categories, selected.category || 'all');
+    setSelectOptions('hotspot-district-filter', payload.districts, currentDistrict);
+    setSelectOptions('hotspot-category-filter', payload.categories, currentCategory);
   } catch (error) {
     console.warn('Could not refresh hotspot filter options', error);
   }
