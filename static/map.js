@@ -1319,25 +1319,40 @@ function renderHotspotSummary(payload) {
   const summary = payload?.summary || {};
   const filters = payload?.filters || {};
 
-  container.innerHTML = `
-    <div class="roadmap-item">
-      <strong>Hotspots detected</strong>
-      <span>${formatNumber(summary.cluster_count)} clusters from ${formatNumber(summary.source_points)} source incidents.</span>
-    </div>
-    <div class="roadmap-item">
-      <strong>Noise filtered out</strong>
-      <span>${formatNumber(summary.noise_points)} points did not form a dense spatial cluster.</span>
-    </div>
-    <div class="roadmap-item">
-      <strong>Scope</strong>
-      <span>${payload?.window || '7d'} · ${filters.district || 'all'} · ${filters.category || 'all'}</span>
-    </div>
-    <div class="hotspot-legend">
-      <span class="hotspot-legend-item"><span class="hotspot-legend-swatch" style="background:#ff6b6b"></span>High density</span>
-      <span class="hotspot-legend-item"><span class="hotspot-legend-swatch" style="background:#f7b267"></span>Medium</span>
-      <span class="hotspot-legend-item"><span class="hotspot-legend-swatch" style="background:#66c7f4"></span>Lower</span>
+  const metricsHtml = `
+    <div class="hotspot-metrics">
+      <div class="roadmap-item">
+        <strong>Hotspots detected</strong>
+        <span>${formatNumber(summary.cluster_count)} clusters from ${formatNumber(summary.source_points)} source incidents.</span>
+      </div>
+      <div class="roadmap-item">
+        <strong>Noise filtered out</strong>
+        <span>${formatNumber(summary.noise_points)} points did not form a dense spatial cluster.</span>
+      </div>
+      <div class="roadmap-item">
+        <strong>Scope</strong>
+        <span>${payload?.window || '7d'} · ${filters.district || 'all'} · ${filters.category || 'all'}</span>
+      </div>
+      <div class="hotspot-legend">
+        <span class="hotspot-legend-item"><span class="hotspot-legend-swatch" style="background:#ff6b6b"></span>High density</span>
+        <span class="hotspot-legend-item"><span class="hotspot-legend-swatch" style="background:#f7b267"></span>Medium</span>
+        <span class="hotspot-legend-item"><span class="hotspot-legend-swatch" style="background:#66c7f4"></span>Lower</span>
+      </div>
     </div>
   `;
+
+  const oldMetrics = container.querySelector('.hotspot-metrics');
+
+  if (oldMetrics) {
+    oldMetrics.outerHTML = metricsHtml;
+  } else {
+    const controls = container.querySelector('.hotspot-controls');
+    if (controls) {
+      controls.insertAdjacentHTML('beforebegin', metricsHtml);
+    } else {
+      container.insertAdjacentHTML('afterbegin', metricsHtml);
+    }
+  }
 }
 
 function renderHotspots(payload) {
@@ -1403,29 +1418,14 @@ function renderHotspots(payload) {
 
 async function refreshHotspotFilterOptions(selected = {}) {
   try {
-    const windowValue =
-      document.getElementById('hotspot-window')?.value ||
-      selected.window ||
-      '7d';
-
-    const currentDistrict =
-      selected.district ||
-      document.getElementById('hotspot-district-filter')?.value ||
-      'all';
-
-    const currentCategory =
-      selected.category ||
-      document.getElementById('hotspot-category-filter')?.value ||
-      'all';
-
     const payload = await apiGet('/api/dashboard/filters', {
-      window: windowValue,
+      window: document.getElementById('hotspot-window')?.value || selected.window || '7d',
       district: 'all',
       category: 'all'
     });
 
-    setSelectOptions('hotspot-district-filter', payload.districts, currentDistrict);
-    setSelectOptions('hotspot-category-filter', payload.categories, currentCategory);
+    setSelectOptions('hotspot-district-filter', payload.districts, selected.district || 'all');
+    setSelectOptions('hotspot-category-filter', payload.categories, selected.category || 'all');
   } catch (error) {
     console.warn('Could not refresh hotspot filter options', error);
   }
@@ -1738,11 +1738,6 @@ async function init() {
   initDragHandle();
   clampMobileSheetHeight();
   await refreshDashboard();
-  await refreshHotspotFilterOptions({
-    window: '7d',
-    district: 'all',
-    category: 'all'
-  });
   requestMapResize();
 }
 
