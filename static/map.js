@@ -280,13 +280,12 @@ function renderForecastSummary(summary) {
 }
 
 function setSelectOptions(selectId, options, selectedValue) {
-  console.log("Options")
-  console.log(options)
-
   const select = document.getElementById(selectId);
   if (!select) return;
 
   const current = selectedValue || 'all';
+
+  // 🔥 LIMPIAR SELECT REAL
   select.innerHTML = '';
 
   (options || []).forEach((option) => {
@@ -297,7 +296,22 @@ function setSelectOptions(selectId, options, selectedValue) {
     select.appendChild(el);
   });
 
-  syncCustomSelect(select);
+  // 🔥 FIX CRÍTICO: RECREAR EL CUSTOM SELECT
+  if (select.dataset.customized === 'true') {
+    const wrapper = select._customWrapper;
+    if (wrapper) {
+      wrapper.replaceWith(select); // eliminar wrapper viejo
+    }
+
+    delete select.dataset.customized;
+    delete select._customWrapper;
+    delete select._customButton;
+    delete select._customLabel;
+    delete select._customMenu;
+  }
+
+  // 🔥 volver a crear correctamente
+  createCustomSelect(select);
 }
 
 
