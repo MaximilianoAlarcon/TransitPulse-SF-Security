@@ -568,37 +568,89 @@ def api_debug_export_source_zip():
 
 @app.route("/api/dashboard/filters")
 def api_dashboard_filters():
+    """
+    Return dashboard filter values from incidents_raw instead of aggregated tables.
+
+    Why:
+    - The map points and hotspot clustering are built from incidents_raw.
+    - Using incident_counts_hourly for filters can hide districts/categories that
+      exist in the raw incident map layer, creating inconsistent UX.
+
+    Behavior:
+    - District options respect the selected time window and selected category.
+    - Category options respect the selected time window and selected district.
+    - Categories are restricted to CATEGORY_FILTER_VALUES, matching the map and hotspots.
+    """
     filters = parse_filters()
-    district_where, district_params = apply_common_filters("h", {**filters, "category": "all"}, "bucket_start")
-    category_where, category_params = apply_common_filters("h", {**filters, "district": "all"}, "bucket_start")
+
+    category_placeholders = ", ".join(["%s"] * len(CATEGORY_FILTER_VALUES))
+
+    district_conditions = [
+        "r.incident_datetime >= %s",
+        "r.incident_datetime < %s",
+        "COALESCE(r.police_district, '') <> ''",
+        f"r.incident_category IN ({category_placeholders})",
+    ]
+    district_params: list[Any] = [
+        filters["start_dt"],
+        filters["end_dt"],
+        *CATEGORY_FILTER_VALUES,
+    ]
+
+    if filters["category"].lower() != "all":
+        district_conditions.append("r.incident_category = %s")
+        district_params.append(filters["category"])
+
+    category_conditions = [
+        "r.incident_datetime >= %s",
+        "r.incident_datetime < %s",
+        "COALESCE(r.incident_category, '') <> ''",
+        f"r.incident_category IN ({category_placeholders})",
+    ]
+    category_params: list[Any] = [
+        filters["start_dt"],
+        filters["end_dt"],
+        *CATEGORY_FILTER_VALUES,
+    ]
+
+    if filters["district"].lower() != "all":
+        category_conditions.append("r.police_district = %s")
+        category_params.append(filters["district"])
 
     districts = fetch_all_dict(
         f"""
-        SELECT h.police_district AS value
-        FROM incident_counts_hourly h
-        WHERE {district_where}
-          AND COALESCE(h.police_district, '') <> ''
-        GROUP BY h.police_district
-        ORDER BY h.police_district;
+        SELECT r.police_district AS value
+        FROM incidents_raw r
+        WHERE {' AND '.join(district_conditions)}
+        GROUP BY r.police_district
+        ORDER BY r.police_district;
         """,
-        district_params,
+        tuple(district_params),
     )
 
     categories = fetch_all_dict(
         f"""
-        SELECT h.incident_category AS value
-        FROM incident_counts_hourly h
-        WHERE {category_where}
-          AND COALESCE(h.incident_category, '') <> ''
-        GROUP BY h.incident_category
-        ORDER BY h.incident_category;
+        SELECT r.incident_category AS value
+        FROM incidents_raw r
+        WHERE {' AND '.join(category_conditions)}
+        GROUP BY r.incident_category
+        ORDER BY r.incident_category;
         """,
-        category_params,
+        tuple(category_params),
     )
 
     return jsonify(
         {
             "status": "ok",
+            "source": "incidents_raw",
+            "filters": {
+                "window": filters["window"],
+                "district": filters["district"],
+                "category": filters["category"],
+                "time_window_start": filters["start_dt"].isoformat(),
+                "time_window_end": filters["end_dt"].isoformat(),
+                "category_filter_count": len(CATEGORY_FILTER_VALUES),
+            },
             "districts": [{"value": "all", "label": "All districts"}] + [
                 {"value": row["value"], "label": row["value"]} for row in districts
             ],
@@ -607,7 +659,6 @@ def api_dashboard_filters():
             ],
         }
     )
-
 
 @app.route("/api/dashboard/overview")
 def api_dashboard_overview():
