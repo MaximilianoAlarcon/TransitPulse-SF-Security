@@ -280,6 +280,9 @@ function renderForecastSummary(summary) {
 }
 
 function setSelectOptions(selectId, options, selectedValue) {
+  console.log("Options")
+  console.log(options)
+
   const select = document.getElementById(selectId);
   if (!select) return;
 
