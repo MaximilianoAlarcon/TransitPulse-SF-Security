@@ -15,7 +15,8 @@ const appState = {
     incidents: null,
     heat: null,
     volumeForecast: null,
-    riskForecast: null
+    riskForecast: null,
+    hotspots: null
   },
   mapData: {
     points: [],
@@ -539,6 +540,11 @@ function clearMapLayers() {
   if (appState.layers.riskForecast) {
     appState.map.removeLayer(appState.layers.riskForecast);
     appState.layers.riskForecast = null;
+  }
+
+  if (appState.layers.hotspots) {
+    appState.map.removeLayer(appState.layers.hotspots);
+    appState.layers.hotspots = null;
   }
 }
 
@@ -1257,6 +1263,236 @@ function renderMap(payload) {
   requestMapResize();
 }
 
+function updateHotspotStatus(text, isError = false) {
+  const el = document.getElementById('hotspot-status');
+  if (!el) return;
+  el.textContent = text;
+  el.classList.toggle('hotspot-status-error', isError);
+  el.classList.toggle('hotspot-status-ok', !isError && text !== 'Not loaded yet.');
+}
+
+function getHotspotParams() {
+  return {
+    window: document.getElementById('hotspot-window')?.value || '7d',
+    district: document.getElementById('hotspot-district-filter')?.value || 'all',
+    category: document.getElementById('hotspot-category-filter')?.value || 'all'
+  };
+}
+
+function hotspotColor(densityScore) {
+  const score = Number(densityScore || 0);
+  if (score >= 0.8) return '#ff6b6b';
+  if (score >= 0.4) return '#f7b267';
+  return '#66c7f4';
+}
+
+function hotspotPopupHtml(properties = {}) {
+  const topDistricts = Array.isArray(properties.top_districts)
+    ? properties.top_districts.map((item) => `<li>${item.district}: ${formatNumber(item.count)}</li>`).join('')
+    : '';
+
+  const topSubcategories = Array.isArray(properties.top_subcategories)
+    ? properties.top_subcategories.map((item) => `<li>${item.subcategory}: ${formatNumber(item.count)}</li>`).join('')
+    : '';
+
+  const latest = properties.latest_incident_datetime
+    ? new Date(properties.latest_incident_datetime).toLocaleString()
+    : 'n/a';
+
+  return `
+    <div class="popup-card hotspot-popup">
+      <strong>${properties.incident_category || 'Hotspot'}</strong><br>
+      <span>${formatNumber(properties.point_count)} clustered incidents</span><br>
+      <span>Density score: ${formatNumber(properties.density_score, 2)}</span><br>
+      <span>Radius: ${formatNumber(properties.radius_meters, 0)}m</span><br>
+      <span>Latest incident: ${latest}</span>
+      ${topDistricts ? `<hr><strong>Top districts</strong><ul>${topDistricts}</ul>` : ''}
+      ${topSubcategories ? `<hr><strong>Top subcategories</strong><ul>${topSubcategories}</ul>` : ''}
+    </div>
+  `;
+}
+
+function renderHotspotSummary(payload) {
+  const container = document.getElementById('hotspot-summary');
+  if (!container) return;
+
+  const summary = payload?.summary || {};
+  const filters = payload?.filters || {};
+  const statusEl = document.getElementById('hotspot-status');
+  const currentStatus = statusEl ? statusEl.textContent : 'Loaded.';
+
+  container.innerHTML = `
+    <div class="roadmap-item">
+      <strong>Hotspots detected</strong>
+      <span>${formatNumber(summary.cluster_count)} clusters from ${formatNumber(summary.source_points)} source incidents.</span>
+    </div>
+    <div class="roadmap-item">
+      <strong>Noise filtered out</strong>
+      <span>${formatNumber(summary.noise_points)} points did not form a dense spatial cluster.</span>
+    </div>
+    <div class="roadmap-item">
+      <strong>Scope</strong>
+      <span>${payload?.window || '7d'} · ${filters.district || 'all'} · ${filters.category || 'all'}</span>
+    </div>
+    <div class="hotspot-legend">
+      <span class="hotspot-legend-item"><span class="hotspot-legend-swatch" style="background:#ff6b6b"></span>High density</span>
+      <span class="hotspot-legend-item"><span class="hotspot-legend-swatch" style="background:#f7b267"></span>Medium</span>
+      <span class="hotspot-legend-item"><span class="hotspot-legend-swatch" style="background:#66c7f4"></span>Lower</span>
+    </div>
+
+    <div class="hotspot-controls mt-3">
+      <div class="row g-2">
+        <div class="col-12">
+          <label class="form-label" for="hotspot-window">Time window</label>
+          <select id="hotspot-window" class="form-select app-select">
+            <option value="24h" ${payload?.window === '24h' ? 'selected' : ''}>Last 24 hours</option>
+            <option value="7d" ${!payload?.window || payload.window === '7d' ? 'selected' : ''}>Last 7 days</option>
+            <option value="30d" ${payload?.window === '30d' ? 'selected' : ''}>Last 30 days</option>
+          </select>
+        </div>
+        <div class="col-12">
+          <label class="form-label" for="hotspot-district-filter">Police district</label>
+          <select id="hotspot-district-filter" class="form-select app-select">
+            <option value="${filters.district || 'all'}" selected>${filters.district === 'all' ? 'All districts' : (filters.district || 'All districts')}</option>
+          </select>
+        </div>
+        <div class="col-12">
+          <label class="form-label" for="hotspot-category-filter">Incident category</label>
+          <select id="hotspot-category-filter" class="form-select app-select">
+            <option value="${filters.category || 'all'}" selected>${filters.category === 'all' ? 'All categories' : (filters.category || 'All categories')}</option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <button id="load-hotspots" class="btn btn-sm btn-outline-light w-100 mt-3" type="button">Reload hotspot clustering</button>
+    <div id="hotspot-status" class="small-muted mt-2">${currentStatus || 'Loaded.'}</div>
+  `;
+
+  initCustomSelects();
+  bindHotspotButton();
+  refreshHotspotFilterOptions(filters);
+}
+
+function renderHotspots(payload) {
+  clearMapLayers();
+
+  const featureCollection = buildCleanFeatureCollection(payload);
+  const features = featureCollection.features;
+
+  appState.layers.hotspots = L.geoJSON(featureCollection, {
+    renderer: L.svg(),
+    style: (feature) => {
+      const properties = feature?.properties || {};
+      const color = hotspotColor(properties.density_score);
+      return {
+        color,
+        weight: 2,
+        opacity: 0.95,
+        fillColor: color,
+        fillOpacity: 0.26,
+        lineJoin: 'round',
+        lineCap: 'round'
+      };
+    },
+    onEachFeature: (feature, layer) => {
+      const properties = feature.properties || {};
+      const label = `${properties.incident_category || 'Hotspot'} · ${formatNumber(properties.point_count)} incidents`;
+
+      layer.bindPopup(hotspotPopupHtml(properties));
+      layer.bindTooltip(label, {
+        sticky: true,
+        direction: 'top',
+        opacity: 0.92
+      });
+
+      layer.on('mouseover', () => {
+        layer.setStyle({ weight: 3, fillOpacity: 0.40 });
+        layer.bringToFront();
+      });
+
+      layer.on('mouseout', () => {
+        appState.layers.hotspots?.resetStyle(layer);
+      });
+    }
+  }).addTo(appState.map);
+
+  if (features.length > 0) {
+    const bounds = appState.layers.hotspots.getBounds();
+    if (bounds && bounds.isValid()) {
+      appState.map.fitBounds(bounds.pad(0.08));
+    }
+  } else if (payload?.center) {
+    appState.map.setView([payload.center.lat, payload.center.lon], 12);
+  }
+
+  const caption = document.getElementById('map-caption');
+  if (caption) {
+    caption.textContent = `Hotspot clustering · ${formatNumber(payload?.summary?.cluster_count || 0)} clusters · ${formatNumber(payload?.summary?.source_points || 0)} points analyzed`;
+  }
+
+  renderHotspotSummary(payload);
+  requestMapResize();
+}
+
+async function refreshHotspotFilterOptions(selected = {}) {
+  try {
+    const payload = await apiGet('/api/dashboard/filters', {
+      window: document.getElementById('hotspot-window')?.value || selected.window || '7d',
+      district: 'all',
+      category: 'all'
+    });
+
+    setSelectOptions('hotspot-district-filter', payload.districts, selected.district || 'all');
+    setSelectOptions('hotspot-category-filter', payload.categories, selected.category || 'all');
+  } catch (error) {
+    console.warn('Could not refresh hotspot filter options', error);
+  }
+}
+
+async function loadHotspots() {
+  const button = document.getElementById('load-hotspots');
+  if (button) {
+    button.disabled = true;
+    button.textContent = 'Running clustering…';
+  }
+
+  updateStatus('Running hotspot clustering…');
+  updateHotspotStatus('Cleaning map and running clustering…');
+  clearMapLayers();
+
+  try {
+    const payload = await apiGet('/api/dashboard/hotspots', getHotspotParams());
+    renderHotspots(payload);
+    updateStatus('Hotspots loaded');
+    updateHotspotStatus('Hotspot layer loaded.');
+  } catch (error) {
+    console.error(error);
+    updateStatus('Failed to load hotspots', true);
+    updateHotspotStatus('Failed to run hotspot clustering.', true);
+  } finally {
+    const refreshedButton = document.getElementById('load-hotspots');
+    if (refreshedButton) {
+      refreshedButton.disabled = false;
+      refreshedButton.textContent = appState.layers.hotspots ? 'Reload hotspot clustering' : 'Run hotspot clustering';
+    }
+  }
+}
+
+function bindHotspotButton() {
+  const button = document.getElementById('load-hotspots');
+  if (button && button.dataset.bound !== 'true') {
+    button.dataset.bound = 'true';
+    button.addEventListener('click', loadHotspots);
+  }
+
+  const windowSelect = document.getElementById('hotspot-window');
+  if (windowSelect && windowSelect.dataset.hotspotBound !== 'true') {
+    windowSelect.dataset.hotspotBound = 'true';
+    windowSelect.addEventListener('change', () => refreshHotspotFilterOptions(getHotspotParams()));
+  }
+}
+
 function refreshVisualSizes() {
   if (appState.map && typeof appState.map.invalidateSize === 'function') {
     appState.map.invalidateSize();
@@ -1283,6 +1519,11 @@ async function refreshFilters() {
   const payload = await apiGet('/api/dashboard/filters', getCommonParams());
   setSelectOptions('district-filter', payload.districts, appState.filters.district);
   setSelectOptions('category-filter', payload.categories, appState.filters.category);
+
+  const hotspotDistrictValue = document.getElementById('hotspot-district-filter')?.value || 'all';
+  const hotspotCategoryValue = document.getElementById('hotspot-category-filter')?.value || 'all';
+  setSelectOptions('hotspot-district-filter', payload.districts, hotspotDistrictValue);
+  setSelectOptions('hotspot-category-filter', payload.categories, hotspotCategoryValue);
 }
 
 async function refreshDashboard() {
@@ -1397,6 +1638,8 @@ function bindEvents() {
   initializeRiskProjectionTimeInput();
   bindVolumeProjectionButton();
   bindRiskProjectionButton();
+  bindHotspotButton();
+  document.getElementById('hotspot-window')?.addEventListener('change', () => refreshHotspotFilterOptions(getHotspotParams()));
 
   document.getElementById('btn-center-sf')?.addEventListener('click', () => {
     appState.map.setView([37.7749, -122.4194], 12);

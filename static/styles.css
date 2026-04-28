@@ -811,3 +811,55 @@ body {
   gap: 6px;
 }
 
+
+/* Hotspot clustering */
+.hotspot-panel,
+.hotspot-controls {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.hotspot-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.hotspot-legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.78rem;
+  color: var(--muted);
+  border: 1px solid rgba(255,255,255,0.08);
+  background: rgba(255,255,255,0.04);
+  border-radius: 999px;
+  padding: 6px 9px;
+}
+
+.hotspot-legend-swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 999px;
+  display: inline-block;
+}
+
+.hotspot-status-ok {
+  color: #b9f4d3 !important;
+}
+
+.hotspot-status-error {
+  color: #ffd0d0 !important;
+}
+
+.hotspot-popup ul {
+  margin: 6px 0 0 16px;
+  padding: 0;
+}
+
+.hotspot-popup hr {
+  border-color: rgba(255,255,255,0.12);
+  margin: 8px 0;
+}
