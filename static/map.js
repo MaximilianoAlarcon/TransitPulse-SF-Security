@@ -1318,8 +1318,6 @@ function renderHotspotSummary(payload) {
 
   const summary = payload?.summary || {};
   const filters = payload?.filters || {};
-  const statusEl = document.getElementById('hotspot-status');
-  const currentStatus = statusEl ? statusEl.textContent : 'Loaded.';
 
   container.innerHTML = `
     <div class="roadmap-item">
@@ -1339,39 +1337,7 @@ function renderHotspotSummary(payload) {
       <span class="hotspot-legend-item"><span class="hotspot-legend-swatch" style="background:#f7b267"></span>Medium</span>
       <span class="hotspot-legend-item"><span class="hotspot-legend-swatch" style="background:#66c7f4"></span>Lower</span>
     </div>
-
-    <div class="hotspot-controls mt-3">
-      <div class="row g-2">
-        <div class="col-12">
-          <label class="form-label" for="hotspot-window">Time window</label>
-          <select id="hotspot-window" class="form-select app-select">
-            <option value="24h" ${payload?.window === '24h' ? 'selected' : ''}>Last 24 hours</option>
-            <option value="7d" ${!payload?.window || payload.window === '7d' ? 'selected' : ''}>Last 7 days</option>
-            <option value="30d" ${payload?.window === '30d' ? 'selected' : ''}>Last 30 days</option>
-          </select>
-        </div>
-        <div class="col-12">
-          <label class="form-label" for="hotspot-district-filter">Police district</label>
-          <select id="hotspot-district-filter" class="form-select app-select">
-            <option value="${filters.district || 'all'}" selected>${filters.district === 'all' ? 'All districts' : (filters.district || 'All districts')}</option>
-          </select>
-        </div>
-        <div class="col-12">
-          <label class="form-label" for="hotspot-category-filter">Incident category</label>
-          <select id="hotspot-category-filter" class="form-select app-select">
-            <option value="${filters.category || 'all'}" selected>${filters.category === 'all' ? 'All categories' : (filters.category || 'All categories')}</option>
-          </select>
-        </div>
-      </div>
-    </div>
-
-    <button id="load-hotspots" class="btn btn-sm btn-outline-light w-100 mt-3" type="button">Reload hotspot clustering</button>
-    <div id="hotspot-status" class="small-muted mt-2">${currentStatus || 'Loaded.'}</div>
   `;
-
-  initCustomSelects();
-  bindHotspotButton();
-  refreshHotspotFilterOptions(filters);
 }
 
 function renderHotspots(payload) {
@@ -1437,14 +1403,29 @@ function renderHotspots(payload) {
 
 async function refreshHotspotFilterOptions(selected = {}) {
   try {
+    const windowValue =
+      document.getElementById('hotspot-window')?.value ||
+      selected.window ||
+      '7d';
+
+    const currentDistrict =
+      selected.district ||
+      document.getElementById('hotspot-district-filter')?.value ||
+      'all';
+
+    const currentCategory =
+      selected.category ||
+      document.getElementById('hotspot-category-filter')?.value ||
+      'all';
+
     const payload = await apiGet('/api/dashboard/filters', {
-      window: document.getElementById('hotspot-window')?.value || selected.window || '7d',
+      window: windowValue,
       district: 'all',
       category: 'all'
     });
 
-    setSelectOptions('hotspot-district-filter', payload.districts, selected.district || 'all');
-    setSelectOptions('hotspot-category-filter', payload.categories, selected.category || 'all');
+    setSelectOptions('hotspot-district-filter', payload.districts, currentDistrict);
+    setSelectOptions('hotspot-category-filter', payload.categories, currentCategory);
   } catch (error) {
     console.warn('Could not refresh hotspot filter options', error);
   }
@@ -1757,6 +1738,11 @@ async function init() {
   initDragHandle();
   clampMobileSheetHeight();
   await refreshDashboard();
+  await refreshHotspotFilterOptions({
+    window: '7d',
+    district: 'all',
+    category: 'all'
+  });
   requestMapResize();
 }
 
