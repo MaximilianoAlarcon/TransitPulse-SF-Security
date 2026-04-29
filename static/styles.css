@@ -863,3 +863,21 @@ body {
   border-color: rgba(255,255,255,0.12);
   margin: 8px 0;
 }
+
+/* Fix custom selects inside collapsible cards */
+.collapsible-card,
+.collapsible-body,
+.hotspot-panel,
+.hotspot-controls {
+  overflow: visible;
+}
+
+.custom-select-menu {
+  max-height: 260px;
+  overflow-y: auto;
+  z-index: 99999;
+}
+
+.custom-select.is-open {
+  z-index: 99999;
+}

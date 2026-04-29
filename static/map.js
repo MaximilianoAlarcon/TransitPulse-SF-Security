@@ -289,6 +289,7 @@ function setSelectOptions(selectId, options, selectedValue) {
   select.innerHTML = '';
 
   (options || []).forEach((option) => {
+
     const el = document.createElement('option');
     el.value = option.value;
     el.textContent = option.label;
@@ -1455,10 +1456,6 @@ async function refreshHotspotFilterOptions(selected = {}) {
       district: 'all',
       category: 'all'
     });
-
-
-    console.log("Options at hotspot section")
-    console.log(payload.districts)
 
     setSelectOptions('hotspot-district-filter', payload.districts, currentDistrict);
     setSelectOptions('hotspot-category-filter', payload.categories, currentCategory);
