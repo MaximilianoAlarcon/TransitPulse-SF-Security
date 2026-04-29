@@ -1212,10 +1212,108 @@ ROUTE_RISK_NUMERIC_FEATURES = [
     "night_ratio_near_route_7d",
     "avg_distance_incidents_m",
     "max_segment_density",
+    "walk_duration_sec",
+    "car_duration_sec",
+    "public_transport_duration_sec",
+    "walk_ratio",
+    "car_ratio",
+    "public_transport_ratio",
+    "walk_distance",
+    "num_transfers",
+    "mode_exposure_factor",
 ]
 
-ROUTE_RISK_CATEGORICAL_FEATURES = ["travel_day_of_week"]
+ROUTE_RISK_CATEGORICAL_FEATURES = ["travel_day_of_week", "dominant_transport_mode"]
 
+
+
+def classify_leg_transport_mode(mode: Any) -> str:
+    normalized = str(mode or "").strip().upper()
+    if normalized == "WALK":
+        return "WALK"
+    if normalized == "CAR":
+        return "CAR"
+    return "PUBLIC_TRANSPORT"
+
+
+def extract_route_mode_features(itinerary: dict[str, Any]) -> dict[str, Any]:
+    legs = itinerary.get("legs") or []
+    total_duration = 0.0
+    walk_duration = 0.0
+    car_duration = 0.0
+    public_duration = 0.0
+    walk_distance = float(itinerary.get("walkDistance") or 0.0)
+    public_leg_count = 0
+    mode_durations = {"WALK": 0.0, "CAR": 0.0, "PUBLIC_TRANSPORT": 0.0}
+
+    for leg in legs:
+        mode_group = classify_leg_transport_mode(leg.get("mode"))
+        try:
+            duration = float(leg.get("duration") or 0.0)
+        except (TypeError, ValueError):
+            duration = 0.0
+
+        total_duration += duration
+        mode_durations[mode_group] += duration
+
+        if mode_group == "WALK":
+            walk_duration += duration
+        elif mode_group == "CAR":
+            car_duration += duration
+        else:
+            public_duration += duration
+            public_leg_count += 1
+
+    if total_duration <= 0:
+        try:
+            total_duration = float(itinerary.get("duration") or 0.0)
+        except (TypeError, ValueError):
+            total_duration = 0.0
+
+    denominator = max(total_duration, 1.0)
+    walk_ratio = walk_duration / denominator
+    car_ratio = car_duration / denominator
+    public_ratio = public_duration / denominator
+    dominant_mode = max(mode_durations, key=mode_durations.get) if legs else "UNKNOWN"
+    num_transfers = max(public_leg_count - 1, 0)
+
+    mode_exposure_factor = (
+        1.00 * walk_ratio
+        + 0.45 * public_ratio
+        + 0.18 * car_ratio
+        + min(num_transfers * 0.05, 0.20)
+    )
+
+    return {
+        "walk_duration_sec": round(walk_duration, 4),
+        "car_duration_sec": round(car_duration, 4),
+        "public_transport_duration_sec": round(public_duration, 4),
+        "walk_ratio": round(walk_ratio, 6),
+        "car_ratio": round(car_ratio, 6),
+        "public_transport_ratio": round(public_ratio, 6),
+        "walk_distance": round(walk_distance, 4),
+        "num_transfers": int(num_transfers),
+        "mode_exposure_factor": round(max(0.0, min(1.0, mode_exposure_factor)), 6),
+        "dominant_transport_mode": dominant_mode,
+    }
+
+
+def ensure_route_risk_mode_columns() -> None:
+    fetch_all_dict(
+        """
+        ALTER TABLE route_risk_features
+            ADD COLUMN IF NOT EXISTS walk_duration_sec double precision DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS car_duration_sec double precision DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS public_transport_duration_sec double precision DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS walk_ratio double precision DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS car_ratio double precision DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS public_transport_ratio double precision DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS walk_distance double precision DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS num_transfers integer DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS mode_exposure_factor double precision DEFAULT 0,
+            ADD COLUMN IF NOT EXISTS dominant_transport_mode text DEFAULT 'UNKNOWN';
+        """
+    )
 
 def get_route_risk_model_path() -> Path:
     return MODEL_DIR / f"{ROUTE_RISK_MODEL_NAME}.joblib"
@@ -1516,16 +1614,10 @@ def compute_route_risk_features_from_db(
 def insert_route_risk_feature(route_id: int, features: dict[str, Any]) -> int:
     """Insert route ML features with a bootstrap target.
 
-    Why target is filled here:
-    - route_risk_features is the training table for ml_risk_route.
-    - target_risk_score / target_risk_level must represent the label that the
-      supervised model learns from.
-    - Until there is real post-trip feedback, we bootstrap that label with the
-      same deterministic risk formula used by the fallback predictor.
-
-    Later, this target can be replaced by a stronger label, for example
-    incidents near the route in the hour after the route was requested.
+    The target includes spatial/temporal risk plus transport exposure:
+    WALK increases exposure, CAR reduces it, and anything else is public transit.
     """
+    ensure_route_risk_mode_columns()
     target_risk_score = round(float(heuristic_route_risk_score(features)), 6)
     target_risk_level = route_risk_level_from_score(target_risk_score)
 
@@ -1545,10 +1637,20 @@ def insert_route_risk_feature(route_id: int, features: dict[str, Any]) -> int:
             night_ratio_near_route_7d,
             avg_distance_incidents_m,
             max_segment_density,
+            walk_duration_sec,
+            car_duration_sec,
+            public_transport_duration_sec,
+            walk_ratio,
+            car_ratio,
+            public_transport_ratio,
+            walk_distance,
+            num_transfers,
+            mode_exposure_factor,
+            dominant_transport_mode,
             target_risk_score,
             target_risk_level
         )
-        VALUES (%s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        VALUES (%s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING route_feature_id;
         """,
         (
@@ -1564,12 +1666,21 @@ def insert_route_risk_feature(route_id: int, features: dict[str, Any]) -> int:
             features.get("night_ratio_near_route_7d"),
             features.get("avg_distance_incidents_m"),
             features.get("max_segment_density"),
+            features.get("walk_duration_sec", 0),
+            features.get("car_duration_sec", 0),
+            features.get("public_transport_duration_sec", 0),
+            features.get("walk_ratio", 0),
+            features.get("car_ratio", 0),
+            features.get("public_transport_ratio", 0),
+            features.get("walk_distance", 0),
+            features.get("num_transfers", 0),
+            features.get("mode_exposure_factor", 0),
+            features.get("dominant_transport_mode", "UNKNOWN"),
             target_risk_score,
             target_risk_level,
         ),
     )
     return int(rows[0]["route_feature_id"])
-
 
 def insert_route_risk_prediction(route_id: int, score: float, level: str) -> int:
     rows = fetch_all_dict(
@@ -1591,27 +1702,31 @@ def insert_route_risk_prediction(route_id: int, score: float, level: str) -> int
 
 def heuristic_route_risk_score(features: dict[str, Any]) -> float:
     count_250 = min(float(features.get("incidents_near_route_250m_24h") or 0) / 20.0, 1.0)
-    count_7d = min(float(features.get("incidents_near_route_7d") or 0) / 120.0, 1.0)
+    count_7d = min(float(features.get("incidents_near_route_7d") or 0) / 180.0, 1.0)
     max_segment = min(float(features.get("max_segment_density") or 0) / 12.0, 1.0)
     avg_distance = float(features.get("avg_distance_incidents_m") or 9999)
     distance_pressure = 1.0 - min(avg_distance / 500.0, 1.0)
     night = max(0.0, min(1.0, float(features.get("night_ratio_near_route_7d") or 0)))
     theft = max(0.0, min(1.0, float(features.get("theft_ratio_near_route_7d") or 0)))
     assault = max(0.0, min(1.0, float(features.get("assault_ratio_near_route_7d") or 0)))
+    exposure = max(0.0, min(1.0, float(features.get("mode_exposure_factor") or 0)))
+    walk_ratio = max(0.0, min(1.0, float(features.get("walk_ratio") or 0)))
+    car_ratio = max(0.0, min(1.0, float(features.get("car_ratio") or 0)))
+    transfers = min(float(features.get("num_transfers") or 0) / 3.0, 1.0)
 
-    score = (
-        0.25 * count_250
-        + 0.22 * count_7d
-        + 0.20 * max_segment
-        + 0.13 * distance_pressure
-        + 0.08 * night
-        + 0.06 * theft
+    base_area_score = (
+        0.20 * count_250
+        + 0.18 * count_7d
+        + 0.17 * max_segment
+        + 0.12 * distance_pressure
+        + 0.07 * night
+        + 0.05 * theft
         + 0.06 * assault
     )
+
+    exposure_multiplier = 0.55 + (0.75 * exposure) + (0.20 * walk_ratio) - (0.18 * car_ratio) + (0.08 * transfers)
+    score = base_area_score * max(0.25, min(1.45, exposure_multiplier))
     return max(0.0, min(1.0, float(score)))
-
-
-
 
 def backfill_route_risk_feature_targets(limit: int | None = None) -> dict[str, Any]:
     """Backfill target_risk_score and target_risk_level for existing NULL rows.
@@ -1698,7 +1813,9 @@ def predict_route_risk_from_features(features: dict[str, Any]) -> dict[str, Any]
             df[column] = pd.to_numeric(df.get(column), errors="coerce").fillna(0)
         df["avg_distance_incidents_m"] = pd.to_numeric(df.get("avg_distance_incidents_m"), errors="coerce").fillna(9999)
         for column in ROUTE_RISK_CATEGORICAL_FEATURES:
-            df[column] = df.get(column, "Unknown").fillna("Unknown").astype(str)
+            if column not in df.columns:
+                df[column] = "UNKNOWN"
+            df[column] = df[column].fillna("UNKNOWN").astype(str)
 
         if isinstance(model, dict) and model.get("model_type") == "RouteRiskRandomForestRegressor":
             pipeline = model["pipeline"]
@@ -1764,6 +1881,7 @@ def evaluate_route_itinerary_risk(
     ) if save else None
 
     features = compute_route_risk_features_from_db(route_wkt, travel_hour, travel_day_of_week)
+    features.update(extract_route_mode_features(itinerary))
     route_feature_id = insert_route_risk_feature(route_id, features) if save and route_id is not None else None
     prediction = predict_route_risk_from_features(features)
     prediction_id = insert_route_risk_prediction(route_id, prediction["risk_score"], prediction["risk_level"]) if save and route_id is not None else None
