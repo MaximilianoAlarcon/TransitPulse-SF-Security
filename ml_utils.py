@@ -2258,6 +2258,27 @@ def evaluate_route_leg_risk(
     }
 
 
+
+def strip_route_geometry_from_response(value: Any) -> Any:
+    """Remove heavy decoded coordinate arrays from route-risk API responses.
+
+    Decoded points are still calculated internally for PostGIS feature extraction,
+    but they are not useful in the public API response because the frontend
+    already has legGeometry.points for drawing. Keep decoded_point_count for
+    debugging and UI summaries.
+    """
+    if isinstance(value, list):
+        return [strip_route_geometry_from_response(item) for item in value]
+
+    if isinstance(value, dict):
+        cleaned: dict[str, Any] = {}
+        for key, item in value.items():
+            if key == "decoded_points":
+                continue
+            cleaned[key] = strip_route_geometry_from_response(item)
+        return cleaned
+
+    return value
 def aggregate_leg_probabilities(leg_risks: list[dict[str, Any]]) -> float:
     no_incident_probability = 1.0
     for leg in leg_risks:
@@ -2319,10 +2340,10 @@ def evaluate_route_itinerary_risk(
         "model_runtime_type": model_runtime_type,
         "fallback_used": fallback_used,
         "decoded_point_count": len(points),
-        "decoded_legs": decoded_legs,
-        "leg_incident_probabilities": leg_risks,
-        "highest_risk_leg": highest_leg,
-        "safest_leg": safest_leg,
+        "decoded_legs": strip_route_geometry_from_response(decoded_legs),
+        "leg_incident_probabilities": strip_route_geometry_from_response(leg_risks),
+        "highest_risk_leg": strip_route_geometry_from_response(highest_leg),
+        "safest_leg": strip_route_geometry_from_response(safest_leg),
         "features": {
             "leg_count": len(leg_risks),
             "walk_leg_count": sum(1 for row in leg_risks if row.get("transport_mode") == "WALK"),
@@ -2357,10 +2378,11 @@ def evaluate_itineraries_route_risk(payload: dict[str, Any]) -> dict[str, Any]:
         item["walkDistance"] = itinerary.get("walkDistance")
         results.append(item)
 
-    sorted_results = sorted(results, key=lambda row: float(row.get("itinerary_incident_probability") or row.get("risk_score") or 0))
+    cleaned_results = strip_route_geometry_from_response(results)
+    sorted_results = sorted(cleaned_results, key=lambda row: float(row.get("itinerary_incident_probability") or row.get("risk_score") or 0))
     return {
-        "route_count": len(results),
-        "routes": results,
+        "route_count": len(cleaned_results),
+        "routes": cleaned_results,
         "safest_route": sorted_results[0] if sorted_results else None,
         "highest_risk_route": sorted_results[-1] if sorted_results else None,
     }
