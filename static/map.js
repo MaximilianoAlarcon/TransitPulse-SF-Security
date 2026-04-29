@@ -1483,6 +1483,8 @@ async function loadHotspots() {
       renderMap(pointPayload);
 
       updateStatus('No hotspots detected');
+      const container = document.getElementById('hotspot-summary');
+      container.innerHTML = '';
       updateHotspotStatus(
         `No dense hotspots found. Showing ${sourcePoints} matching incidents instead.`
       );
