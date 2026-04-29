@@ -1456,6 +1456,10 @@ async function refreshHotspotFilterOptions(selected = {}) {
       category: 'all'
     });
 
+
+    console.log("Options at hotspot section")
+    console.log(payload.districts)
+
     setSelectOptions('hotspot-district-filter', payload.districts, currentDistrict);
     setSelectOptions('hotspot-category-filter', payload.categories, currentCategory);
   } catch (error) {
