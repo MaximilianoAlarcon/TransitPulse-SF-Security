@@ -1514,6 +1514,21 @@ def compute_route_risk_features_from_db(
 
 
 def insert_route_risk_feature(route_id: int, features: dict[str, Any]) -> int:
+    """Insert route ML features with a bootstrap target.
+
+    Why target is filled here:
+    - route_risk_features is the training table for ml_risk_route.
+    - target_risk_score / target_risk_level must represent the label that the
+      supervised model learns from.
+    - Until there is real post-trip feedback, we bootstrap that label with the
+      same deterministic risk formula used by the fallback predictor.
+
+    Later, this target can be replaced by a stronger label, for example
+    incidents near the route in the hour after the route was requested.
+    """
+    target_risk_score = round(float(heuristic_route_risk_score(features)), 6)
+    target_risk_level = route_risk_level_from_score(target_risk_score)
+
     rows = fetch_all_dict(
         """
         INSERT INTO route_risk_features (
@@ -1533,7 +1548,7 @@ def insert_route_risk_feature(route_id: int, features: dict[str, Any]) -> int:
             target_risk_score,
             target_risk_level
         )
-        VALUES (%s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, NULL)
+        VALUES (%s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         RETURNING route_feature_id;
         """,
         (
@@ -1549,6 +1564,8 @@ def insert_route_risk_feature(route_id: int, features: dict[str, Any]) -> int:
             features.get("night_ratio_near_route_7d"),
             features.get("avg_distance_incidents_m"),
             features.get("max_segment_density"),
+            target_risk_score,
+            target_risk_level,
         ),
     )
     return int(rows[0]["route_feature_id"])
@@ -1592,6 +1609,77 @@ def heuristic_route_risk_score(features: dict[str, Any]) -> float:
         + 0.06 * assault
     )
     return max(0.0, min(1.0, float(score)))
+
+
+
+
+def backfill_route_risk_feature_targets(limit: int | None = None) -> dict[str, Any]:
+    """Backfill target_risk_score and target_risk_level for existing NULL rows.
+
+    Use this once after deploying this version if old rows were inserted before
+    targets were calculated. It updates only rows where either target is NULL.
+    """
+    limit_clause = ""
+    params: list[Any] = []
+
+    if limit is not None:
+        limit_clause = "LIMIT %s"
+        params.append(max(1, int(limit)))
+
+    rows = fetch_all_dict(
+        f"""
+        SELECT
+            route_feature_id,
+            travel_hour,
+            travel_day_of_week,
+            incidents_near_route_100m_24h,
+            incidents_near_route_250m_24h,
+            incidents_near_route_500m_24h,
+            incidents_near_route_7d,
+            theft_ratio_near_route_7d,
+            assault_ratio_near_route_7d,
+            night_ratio_near_route_7d,
+            avg_distance_incidents_m,
+            max_segment_density
+        FROM route_risk_features
+        WHERE target_risk_score IS NULL
+           OR target_risk_level IS NULL
+        ORDER BY route_feature_id ASC
+        {limit_clause};
+        """,
+        tuple(params),
+    )
+
+    updated = 0
+    for row in rows:
+        score = round(float(heuristic_route_risk_score(row)), 6)
+        level = route_risk_level_from_score(score)
+        fetch_all_dict(
+            """
+            UPDATE route_risk_features
+            SET target_risk_score = %s,
+                target_risk_level = %s,
+                updated_at = NOW()
+            WHERE route_feature_id = %s;
+            """,
+            (score, level, row["route_feature_id"]),
+        )
+        updated += 1
+
+    remaining_rows = fetch_all_dict(
+        """
+        SELECT COUNT(*) AS count
+        FROM route_risk_features
+        WHERE target_risk_score IS NULL
+           OR target_risk_level IS NULL;
+        """
+    )
+
+    return {
+        "status": "ok",
+        "updated_rows": updated,
+        "remaining_null_rows": int(remaining_rows[0]["count"]),
+    }
 
 
 def predict_route_risk_from_features(features: dict[str, Any]) -> dict[str, Any]:
