@@ -284,12 +284,9 @@ function setSelectOptions(selectId, options, selectedValue) {
   if (!select) return;
 
   const current = selectedValue || 'all';
-
-  // 🔥 LIMPIAR SELECT REAL
   select.innerHTML = '';
 
   (options || []).forEach((option) => {
-
     const el = document.createElement('option');
     el.value = option.value;
     el.textContent = option.label;
@@ -297,22 +294,7 @@ function setSelectOptions(selectId, options, selectedValue) {
     select.appendChild(el);
   });
 
-  // 🔥 FIX CRÍTICO: RECREAR EL CUSTOM SELECT
-  if (select.dataset.customized === 'true') {
-    const wrapper = select._customWrapper;
-    if (wrapper) {
-      wrapper.replaceWith(select); // eliminar wrapper viejo
-    }
-
-    delete select.dataset.customized;
-    delete select._customWrapper;
-    delete select._customButton;
-    delete select._customLabel;
-    delete select._customMenu;
-  }
-
-  // 🔥 volver a crear correctamente
-  createCustomSelect(select);
+  syncCustomSelect(select);
 }
 
 
@@ -1476,10 +1458,43 @@ async function loadHotspots() {
   clearMapLayers();
 
   try {
-    const payload = await apiGet('/api/dashboard/hotspots', getHotspotParams());
-    renderHotspots(payload);
-    updateStatus('Hotspots loaded');
-    updateHotspotStatus('Hotspot layer loaded.');
+    const params = getHotspotParams();
+
+    const payload = await apiGet('/api/dashboard/hotspots', params);
+
+    const clusterCount = payload?.summary?.cluster_count || 0;
+    const sourcePoints = payload?.summary?.source_points || 0;
+
+    // 🔥 CASO 1: hay clusters → normal
+    if (clusterCount > 0) {
+      renderHotspots(payload);
+      updateStatus('Hotspots loaded');
+      updateHotspotStatus('Hotspot layer loaded.');
+      return;
+    }
+
+    // 🔥 CASO 2: no hay clusters pero sí puntos → fallback a puntos
+    if (sourcePoints > 0) {
+      const pointPayload = await apiGet('/api/dashboard/map-points', {
+        ...params,
+        risk_mode: appState.filters.riskMode
+      });
+
+      renderMap(pointPayload);
+
+      updateStatus('No hotspots detected');
+      updateHotspotStatus(
+        `No dense hotspots found. Showing ${sourcePoints} matching incidents instead.`
+      );
+      return;
+    }
+
+    // 🔥 CASO 3: no hay nada
+    updateStatus('No data for selected filters');
+    updateHotspotStatus(
+      'No incidents found for the selected filters. Try a wider time window.'
+    );
+
   } catch (error) {
     console.error(error);
     updateStatus('Failed to load hotspots', true);
@@ -1488,7 +1503,9 @@ async function loadHotspots() {
     const refreshedButton = document.getElementById('load-hotspots');
     if (refreshedButton) {
       refreshedButton.disabled = false;
-      refreshedButton.textContent = appState.layers.hotspots ? 'Reload hotspot clustering' : 'Run hotspot clustering';
+      refreshedButton.textContent = appState.layers.hotspots
+        ? 'Reload hotspot clustering'
+        : 'Run hotspot clustering';
     }
   }
 }
