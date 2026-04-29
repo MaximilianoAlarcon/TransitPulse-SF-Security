@@ -1192,3 +1192,539 @@ def build_risk_forecast_geojson(
         "category_level_policy": "top_risk_categories are ranked by risk_score only; they do not define district risk_level",
     }
 
+
+
+# -----------------------
+# Route risk model utilities
+# -----------------------
+
+ROUTE_RISK_MODEL_NAME = os.environ.get("ROUTE_RISK_MODEL_NAME", "ml_risk_route")
+ROUTE_RISK_MODEL_CACHE: dict[str, Any] = {"model": None, "source": None}
+
+ROUTE_RISK_NUMERIC_FEATURES = [
+    "travel_hour",
+    "incidents_near_route_100m_24h",
+    "incidents_near_route_250m_24h",
+    "incidents_near_route_500m_24h",
+    "incidents_near_route_7d",
+    "theft_ratio_near_route_7d",
+    "assault_ratio_near_route_7d",
+    "night_ratio_near_route_7d",
+    "avg_distance_incidents_m",
+    "max_segment_density",
+]
+
+ROUTE_RISK_CATEGORICAL_FEATURES = ["travel_day_of_week"]
+
+
+def get_route_risk_model_path() -> Path:
+    return MODEL_DIR / f"{ROUTE_RISK_MODEL_NAME}.joblib"
+
+
+def get_route_risk_model_artifact_keys() -> dict[str, str]:
+    return {
+        "model": f"{MODEL_S3_PREFIX.rstrip('/')}/{ROUTE_RISK_MODEL_NAME}.joblib",
+        "metrics": f"{MODEL_S3_PREFIX.rstrip('/')}/{ROUTE_RISK_MODEL_NAME}_metrics.json",
+    }
+
+
+def read_route_risk_model_metrics_from_bucket() -> dict[str, Any] | None:
+    keys = get_route_risk_model_artifact_keys()
+    try:
+        raw = download_bytes_from_model_bucket(keys["metrics"])
+    except Exception:
+        return None
+    return json.loads(raw.decode("utf-8"))
+
+
+def read_route_risk_model_metrics() -> dict[str, Any] | None:
+    metrics_path = MODEL_DIR / f"{ROUTE_RISK_MODEL_NAME}_metrics.json"
+    if metrics_path.exists():
+        return json.loads(metrics_path.read_text(encoding="utf-8"))
+    if MODEL_BUCKET_NAME and MODEL_BUCKET_ENDPOINT_URL:
+        return read_route_risk_model_metrics_from_bucket()
+    return None
+
+
+def load_route_risk_model_from_bucket() -> Any:
+    try:
+        import joblib
+    except ImportError as exc:
+        raise RuntimeError("Missing ML dependency. Add joblib to requirements.txt.") from exc
+
+    keys = get_route_risk_model_artifact_keys()
+    raw = download_bytes_from_model_bucket(keys["model"])
+    return joblib.load(io.BytesIO(raw))
+
+
+def load_route_risk_model() -> tuple[Any, str]:
+    cached_model = ROUTE_RISK_MODEL_CACHE.get("model")
+    cached_source = ROUTE_RISK_MODEL_CACHE.get("source")
+    if cached_model is not None:
+        return cached_model, str(cached_source or "memory_cache")
+
+    try:
+        import joblib
+    except ImportError as exc:
+        raise RuntimeError("Missing ML dependency. Add joblib to requirements.txt.") from exc
+
+    model_path = get_route_risk_model_path()
+    if model_path.exists():
+        model = joblib.load(model_path)
+        ROUTE_RISK_MODEL_CACHE["model"] = model
+        ROUTE_RISK_MODEL_CACHE["source"] = str(model_path)
+        return model, str(model_path)
+
+    model = load_route_risk_model_from_bucket()
+    ROUTE_RISK_MODEL_CACHE["model"] = model
+    ROUTE_RISK_MODEL_CACHE["source"] = f"s3://{MODEL_BUCKET_NAME}/{get_route_risk_model_artifact_keys()['model']}"
+
+    try:
+        MODEL_DIR.mkdir(parents=True, exist_ok=True)
+        joblib.dump(model, model_path)
+    except Exception:
+        pass
+
+    return model, str(ROUTE_RISK_MODEL_CACHE["source"])
+
+
+def decode_polyline(encoded: str) -> list[list[float]]:
+    """Decode Google/OTP encoded polyline into [[lat, lon], ...]."""
+    if not encoded:
+        return []
+
+    index = 0
+    coordinates: list[list[float]] = []
+    lat = 0
+    lng = 0
+
+    while index < len(encoded):
+        result = 0
+        shift = 0
+        while True:
+            byte = ord(encoded[index]) - 63
+            index += 1
+            result |= (byte & 0x1F) << shift
+            shift += 5
+            if byte < 0x20:
+                break
+        delta_lat = ~(result >> 1) if result & 1 else result >> 1
+        lat += delta_lat
+
+        result = 0
+        shift = 0
+        while True:
+            byte = ord(encoded[index]) - 63
+            index += 1
+            result |= (byte & 0x1F) << shift
+            shift += 5
+            if byte < 0x20:
+                break
+        delta_lng = ~(result >> 1) if result & 1 else result >> 1
+        lng += delta_lng
+
+        coordinates.append([lat / 1e5, lng / 1e5])
+
+    return coordinates
+
+
+def safe_epoch_ms_to_datetime(value: Any) -> datetime:
+    try:
+        milliseconds = int(value)
+        return datetime.fromtimestamp(milliseconds / 1000.0)
+    except Exception:
+        return datetime.utcnow()
+
+
+def normalize_route_points(points: list[list[float]]) -> list[list[float]]:
+    cleaned: list[list[float]] = []
+    for point in points:
+        if not isinstance(point, (list, tuple)) or len(point) < 2:
+            continue
+        try:
+            lat = float(point[0])
+            lon = float(point[1])
+        except (TypeError, ValueError):
+            continue
+        if not (-90 <= lat <= 90 and -180 <= lon <= 180):
+            continue
+        if cleaned and abs(cleaned[-1][0] - lat) < 1e-8 and abs(cleaned[-1][1] - lon) < 1e-8:
+            continue
+        cleaned.append([lat, lon])
+    return cleaned
+
+
+def build_linestring_wkt(points: list[list[float]]) -> str:
+    clean_points = normalize_route_points(points)
+    if len(clean_points) < 2:
+        raise ValueError("A route needs at least two valid coordinates to build a LINESTRING.")
+    lon_lat_pairs = [f"{lon:.7f} {lat:.7f}" for lat, lon in clean_points]
+    return "LINESTRING(" + ", ".join(lon_lat_pairs) + ")"
+
+
+def extract_itineraries_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    if isinstance(payload.get("itineraries"), list):
+        return payload["itineraries"]
+
+    collapse_keys = sorted(key for key in payload.keys() if str(key).startswith("collapse"))
+    if collapse_keys:
+        return [payload[key] | {"itinerary_id": key} for key in collapse_keys if isinstance(payload.get(key), dict)]
+
+    if isinstance(payload.get("legs"), list):
+        return [payload]
+
+    raise ValueError("Payload must include 'itineraries', collapse* route objects, or a single object with 'legs'.")
+
+
+def decode_itinerary_points(itinerary: dict[str, Any]) -> tuple[list[list[float]], list[dict[str, Any]]]:
+    all_points: list[list[float]] = []
+    decoded_legs: list[dict[str, Any]] = []
+
+    for leg_index, leg in enumerate(itinerary.get("legs") or []):
+        encoded = ((leg.get("legGeometry") or {}).get("points") or "").strip()
+        points = normalize_route_points(decode_polyline(encoded)) if encoded else []
+        if not points:
+            from_point = leg.get("from") or {}
+            to_point = leg.get("to") or {}
+            points = normalize_route_points(
+                [
+                    [from_point.get("lat"), from_point.get("lon")],
+                    [to_point.get("lat"), to_point.get("lon")],
+                ]
+            )
+
+        if all_points and points:
+            all_points.extend(points[1:] if all_points[-1] == points[0] else points)
+        else:
+            all_points.extend(points)
+
+        decoded_legs.append(
+            {
+                "leg_index": leg_index,
+                "mode": leg.get("mode"),
+                "route": leg.get("route"),
+                "agency": leg.get("agency"),
+                "from": leg.get("from"),
+                "to": leg.get("to"),
+                "startTime": leg.get("startTime"),
+                "endTime": leg.get("endTime"),
+                "duration": leg.get("duration"),
+                "decoded_point_count": len(points),
+                "decoded_points": points,
+            }
+        )
+
+    return normalize_route_points(all_points), decoded_legs
+
+
+def route_risk_level_from_score(score: float) -> str:
+    value = max(0.0, min(1.0, float(score or 0)))
+    if value >= 0.75:
+        return "Very High"
+    if value >= 0.55:
+        return "High"
+    if value >= 0.30:
+        return "Medium"
+    return "Low"
+
+
+def insert_route_request(
+    route_wkt: str,
+    origin_lat: float | None,
+    origin_lon: float | None,
+    dest_lat: float | None,
+    dest_lon: float | None,
+    travel_hour: int,
+    travel_day_of_week: str,
+) -> int:
+    rows = fetch_all_dict(
+        """
+        INSERT INTO route_requests (
+            requested_at,
+            origin_lat,
+            origin_lon,
+            dest_lat,
+            dest_lon,
+            route_geom,
+            travel_hour,
+            travel_day_of_week
+        )
+        VALUES (
+            NOW(), %s, %s, %s, %s, ST_GeomFromText(%s, 4326), %s, %s
+        )
+        RETURNING route_id;
+        """,
+        (origin_lat, origin_lon, dest_lat, dest_lon, route_wkt, travel_hour, travel_day_of_week),
+    )
+    return int(rows[0]["route_id"])
+
+
+def compute_route_risk_features_from_db(
+    route_wkt: str,
+    travel_hour: int,
+    travel_day_of_week: str,
+) -> dict[str, Any]:
+    rows = fetch_all_dict(
+        """
+        WITH route AS (
+            SELECT ST_GeomFromText(%s, 4326) AS geom
+        ), incidents_24h AS (
+            SELECT i.*
+            FROM incidents_raw i, route r
+            WHERE i.geom IS NOT NULL
+              AND i.incident_datetime >= NOW() - INTERVAL '24 hours'
+              AND ST_DWithin(i.geom::geography, r.geom::geography, 500)
+        ), incidents_7d AS (
+            SELECT i.*
+            FROM incidents_raw i, route r
+            WHERE i.geom IS NOT NULL
+              AND i.incident_datetime >= NOW() - INTERVAL '7 days'
+              AND ST_DWithin(i.geom::geography, r.geom::geography, 500)
+        ), segments AS (
+            SELECT ST_LineSubstring(r.geom, gs::float8, LEAST((gs + 0.05)::float8, 1.0)) AS geom
+            FROM route r, generate_series(0.0, 0.95, 0.05) AS gs
+        ), segment_counts AS (
+            SELECT COUNT(i.row_id) AS incident_count
+            FROM segments s
+            LEFT JOIN incidents_raw i
+              ON i.geom IS NOT NULL
+             AND i.incident_datetime >= NOW() - INTERVAL '24 hours'
+             AND ST_DWithin(i.geom::geography, s.geom::geography, 250)
+            GROUP BY s.geom
+        )
+        SELECT
+            %s::int AS travel_hour,
+            %s::text AS travel_day_of_week,
+            (SELECT COUNT(*) FROM incidents_24h i, route r WHERE ST_DWithin(i.geom::geography, r.geom::geography, 100))::int AS incidents_near_route_100m_24h,
+            (SELECT COUNT(*) FROM incidents_24h i, route r WHERE ST_DWithin(i.geom::geography, r.geom::geography, 250))::int AS incidents_near_route_250m_24h,
+            (SELECT COUNT(*) FROM incidents_24h)::int AS incidents_near_route_500m_24h,
+            (SELECT COUNT(*) FROM incidents_7d)::int AS incidents_near_route_7d,
+            COALESCE((SELECT AVG(CASE WHEN incident_category ILIKE '%%theft%%' OR incident_category ILIKE '%%larceny%%' THEN 1.0 ELSE 0.0 END) FROM incidents_7d), 0.0) AS theft_ratio_near_route_7d,
+            COALESCE((SELECT AVG(CASE WHEN incident_category ILIKE '%%assault%%' THEN 1.0 ELSE 0.0 END) FROM incidents_7d), 0.0) AS assault_ratio_near_route_7d,
+            COALESCE((SELECT AVG(CASE WHEN EXTRACT(HOUR FROM incident_datetime) >= 20 OR EXTRACT(HOUR FROM incident_datetime) <= 5 THEN 1.0 ELSE 0.0 END) FROM incidents_7d), 0.0) AS night_ratio_near_route_7d,
+            COALESCE((SELECT AVG(ST_Distance(i.geom::geography, r.geom::geography)) FROM incidents_7d i, route r), 9999.0) AS avg_distance_incidents_m,
+            COALESCE((SELECT MAX(incident_count)::double precision FROM segment_counts), 0.0) AS max_segment_density;
+        """,
+        (route_wkt, travel_hour, travel_day_of_week),
+    )
+
+    if not rows:
+        raise RuntimeError("Could not compute route risk features.")
+    return dict(rows[0])
+
+
+def insert_route_risk_feature(route_id: int, features: dict[str, Any]) -> int:
+    rows = fetch_all_dict(
+        """
+        INSERT INTO route_risk_features (
+            route_id,
+            computed_at,
+            travel_hour,
+            travel_day_of_week,
+            incidents_near_route_100m_24h,
+            incidents_near_route_250m_24h,
+            incidents_near_route_500m_24h,
+            incidents_near_route_7d,
+            theft_ratio_near_route_7d,
+            assault_ratio_near_route_7d,
+            night_ratio_near_route_7d,
+            avg_distance_incidents_m,
+            max_segment_density,
+            target_risk_score,
+            target_risk_level
+        )
+        VALUES (%s, NOW(), %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NULL, NULL)
+        RETURNING route_feature_id;
+        """,
+        (
+            route_id,
+            features.get("travel_hour"),
+            features.get("travel_day_of_week"),
+            features.get("incidents_near_route_100m_24h"),
+            features.get("incidents_near_route_250m_24h"),
+            features.get("incidents_near_route_500m_24h"),
+            features.get("incidents_near_route_7d"),
+            features.get("theft_ratio_near_route_7d"),
+            features.get("assault_ratio_near_route_7d"),
+            features.get("night_ratio_near_route_7d"),
+            features.get("avg_distance_incidents_m"),
+            features.get("max_segment_density"),
+        ),
+    )
+    return int(rows[0]["route_feature_id"])
+
+
+def insert_route_risk_prediction(route_id: int, score: float, level: str) -> int:
+    rows = fetch_all_dict(
+        """
+        INSERT INTO route_risk_predictions (
+            model_name,
+            generated_at,
+            route_id,
+            risk_score,
+            risk_level
+        )
+        VALUES (%s, NOW(), %s, %s, %s)
+        RETURNING prediction_id;
+        """,
+        (ROUTE_RISK_MODEL_NAME, route_id, score, level),
+    )
+    return int(rows[0]["prediction_id"])
+
+
+def heuristic_route_risk_score(features: dict[str, Any]) -> float:
+    count_250 = min(float(features.get("incidents_near_route_250m_24h") or 0) / 20.0, 1.0)
+    count_7d = min(float(features.get("incidents_near_route_7d") or 0) / 120.0, 1.0)
+    max_segment = min(float(features.get("max_segment_density") or 0) / 12.0, 1.0)
+    avg_distance = float(features.get("avg_distance_incidents_m") or 9999)
+    distance_pressure = 1.0 - min(avg_distance / 500.0, 1.0)
+    night = max(0.0, min(1.0, float(features.get("night_ratio_near_route_7d") or 0)))
+    theft = max(0.0, min(1.0, float(features.get("theft_ratio_near_route_7d") or 0)))
+    assault = max(0.0, min(1.0, float(features.get("assault_ratio_near_route_7d") or 0)))
+
+    score = (
+        0.25 * count_250
+        + 0.22 * count_7d
+        + 0.20 * max_segment
+        + 0.13 * distance_pressure
+        + 0.08 * night
+        + 0.06 * theft
+        + 0.06 * assault
+    )
+    return max(0.0, min(1.0, float(score)))
+
+
+def predict_route_risk_from_features(features: dict[str, Any]) -> dict[str, Any]:
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise RuntimeError("Missing ML dependency. Add pandas to requirements.txt.") from exc
+
+    model_source = None
+    model_runtime_type = None
+
+    try:
+        model, model_source = load_route_risk_model()
+        df = pd.DataFrame([features])
+        for column in ROUTE_RISK_NUMERIC_FEATURES:
+            df[column] = pd.to_numeric(df.get(column), errors="coerce").fillna(0)
+        df["avg_distance_incidents_m"] = pd.to_numeric(df.get("avg_distance_incidents_m"), errors="coerce").fillna(9999)
+        for column in ROUTE_RISK_CATEGORICAL_FEATURES:
+            df[column] = df.get(column, "Unknown").fillna("Unknown").astype(str)
+
+        if isinstance(model, dict) and model.get("model_type") == "RouteRiskRandomForestRegressor":
+            pipeline = model["pipeline"]
+            feature_columns = model.get("feature_columns") or ROUTE_RISK_NUMERIC_FEATURES + ROUTE_RISK_CATEGORICAL_FEATURES
+            score = float(pipeline.predict(df[feature_columns])[0])
+            model_runtime_type = model.get("model_type")
+        else:
+            score = float(model.predict(df[ROUTE_RISK_NUMERIC_FEATURES + ROUTE_RISK_CATEGORICAL_FEATURES])[0])
+            model_runtime_type = type(model).__name__
+
+        score = max(0.0, min(1.0, score))
+        fallback_used = False
+    except Exception as exc:
+        score = heuristic_route_risk_score(features)
+        model_source = f"heuristic_fallback: {exc}"
+        model_runtime_type = "heuristic_route_risk_score"
+        fallback_used = True
+
+    level = route_risk_level_from_score(score)
+    return {
+        "risk_score": round(score, 4),
+        "risk_level": level,
+        "model_name": ROUTE_RISK_MODEL_NAME,
+        "model_source": model_source,
+        "model_runtime_type": model_runtime_type,
+        "fallback_used": fallback_used,
+    }
+
+
+def evaluate_route_itinerary_risk(
+    itinerary: dict[str, Any],
+    origin_lat: float | None = None,
+    origin_lon: float | None = None,
+    dest_lat: float | None = None,
+    dest_lon: float | None = None,
+    save: bool = True,
+) -> dict[str, Any]:
+    points, decoded_legs = decode_itinerary_points(itinerary)
+    route_wkt = build_linestring_wkt(points)
+
+    start_time = itinerary.get("startTime")
+    if not start_time and itinerary.get("legs"):
+        start_time = (itinerary["legs"][0] or {}).get("startTime")
+    travel_dt = safe_epoch_ms_to_datetime(start_time)
+    travel_hour = int(travel_dt.hour)
+    travel_day_of_week = travel_dt.strftime("%A")
+
+    if origin_lat is None or origin_lon is None:
+        if points:
+            origin_lat, origin_lon = points[0]
+    if dest_lat is None or dest_lon is None:
+        if points:
+            dest_lat, dest_lon = points[-1]
+
+    route_id = insert_route_request(
+        route_wkt=route_wkt,
+        origin_lat=origin_lat,
+        origin_lon=origin_lon,
+        dest_lat=dest_lat,
+        dest_lon=dest_lon,
+        travel_hour=travel_hour,
+        travel_day_of_week=travel_day_of_week,
+    ) if save else None
+
+    features = compute_route_risk_features_from_db(route_wkt, travel_hour, travel_day_of_week)
+    route_feature_id = insert_route_risk_feature(route_id, features) if save and route_id is not None else None
+    prediction = predict_route_risk_from_features(features)
+    prediction_id = insert_route_risk_prediction(route_id, prediction["risk_score"], prediction["risk_level"]) if save and route_id is not None else None
+
+    return {
+        "route_id": route_id,
+        "route_feature_id": route_feature_id,
+        "prediction_id": prediction_id,
+        "risk_score": prediction["risk_score"],
+        "risk_level": prediction["risk_level"],
+        "model_name": prediction["model_name"],
+        "model_source": prediction["model_source"],
+        "model_runtime_type": prediction["model_runtime_type"],
+        "fallback_used": prediction["fallback_used"],
+        "features": features,
+        "decoded_point_count": len(points),
+        "decoded_legs": decoded_legs,
+    }
+
+
+def evaluate_itineraries_route_risk(payload: dict[str, Any]) -> dict[str, Any]:
+    itineraries = extract_itineraries_from_payload(payload)
+    save = bool(payload.get("save", True))
+    origin_lat = payload.get("origin_lat")
+    origin_lon = payload.get("origin_lon")
+    dest_lat = payload.get("dest_lat")
+    dest_lon = payload.get("dest_lon")
+
+    results: list[dict[str, Any]] = []
+    for index, itinerary in enumerate(itineraries):
+        item = evaluate_route_itinerary_risk(
+            itinerary,
+            origin_lat=origin_lat,
+            origin_lon=origin_lon,
+            dest_lat=dest_lat,
+            dest_lon=dest_lon,
+            save=save,
+        )
+        item["itinerary_index"] = index
+        item["itinerary_id"] = itinerary.get("itinerary_id") or itinerary.get("id") or f"itinerary_{index + 1}"
+        item["duration"] = itinerary.get("duration")
+        item["generalizedCost"] = itinerary.get("generalizedCost")
+        item["walkDistance"] = itinerary.get("walkDistance")
+        results.append(item)
+
+    sorted_results = sorted(results, key=lambda row: float(row.get("risk_score") or 0))
+    return {
+        "route_count": len(results),
+        "routes": results,
+        "safest_route": sorted_results[0] if sorted_results else None,
+        "highest_risk_route": sorted_results[-1] if sorted_results else None,
+    }

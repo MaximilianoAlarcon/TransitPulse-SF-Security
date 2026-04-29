@@ -24,6 +24,9 @@ from ml_utils import (
     MODEL_DIR,
     RISK_CLASSIFIER_MODEL_NAME,
     VOLUME_MODEL_NAME,
+    ROUTE_RISK_MODEL_NAME,
+    evaluate_itineraries_route_risk,
+    read_route_risk_model_metrics,
     build_risk_forecast_geojson,
     build_volume_forecast_geojson,
     fetch_latest_volume_features,
@@ -1427,6 +1430,37 @@ def api_dashboard_ml_risk_polygons():
             }
         )
 
+    except Exception as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 500
+
+
+@app.route("/api/ml/route-risk", methods=["POST"])
+def api_ml_route_risk():
+    """
+    Evaluate route risk for one or more OTP itineraries.
+
+    Expected payload shapes:
+    1) {"itineraries": [{"legs": [...]}], "origin_lat": ..., "origin_lon": ..., "dest_lat": ..., "dest_lon": ...}
+    2) the current GPS SF response shape with collapse1/collapse2/... objects.
+
+    The endpoint decodes legGeometry.points in the backend, stores route_requests /
+    route_risk_features / route_risk_predictions by default, and returns a risk
+    score for each itinerary. Set "save": false to evaluate without storing.
+    """
+    payload = request.get_json(silent=True) or {}
+
+    try:
+        result = evaluate_itineraries_route_risk(payload)
+        return jsonify(
+            {
+                "status": "ok",
+                "model_name": ROUTE_RISK_MODEL_NAME,
+                "metrics": read_route_risk_model_metrics(),
+                **result,
+            }
+        )
+    except ValueError as exc:
+        return jsonify({"status": "error", "message": str(exc)}), 400
     except Exception as exc:
         return jsonify({"status": "error", "message": str(exc)}), 500
 
