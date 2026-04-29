@@ -1508,7 +1508,6 @@ def decode_itinerary_points(itinerary: dict[str, Any]) -> tuple[list[list[float]
                 "endTime": leg.get("endTime"),
                 "duration": leg.get("duration"),
                 "decoded_point_count": len(points),
-                "decoded_points": points,
             }
         )
 
@@ -2245,7 +2244,6 @@ def evaluate_route_leg_risk(
         "startTime": leg.get("startTime"),
         "endTime": leg.get("endTime"),
         "decoded_point_count": len(points),
-        "decoded_points": points,
         "leg_distance_m": round(leg_distance_m, 2),
         "leg_incident_probability": prediction["leg_incident_probability"],
         "risk_level": prediction["risk_level"],
