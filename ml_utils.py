@@ -1897,8 +1897,7 @@ def evaluate_route_itinerary_risk(
         "model_runtime_type": prediction["model_runtime_type"],
         "fallback_used": prediction["fallback_used"],
         "features": features,
-        "decoded_point_count": len(points),
-        "decoded_legs": decoded_legs,
+        "decoded_point_count": len(points)
     }
 
 
@@ -1928,6 +1927,437 @@ def evaluate_itineraries_route_risk(payload: dict[str, Any]) -> dict[str, Any]:
         results.append(item)
 
     sorted_results = sorted(results, key=lambda row: float(row.get("risk_score") or 0))
+    return {
+        "route_count": len(results),
+        "routes": results,
+        "safest_route": sorted_results[0] if sorted_results else None,
+        "highest_risk_route": sorted_results[-1] if sorted_results else None,
+    }
+
+
+import math
+
+# -----------------------------------------------------------------------------
+# Route leg incident probability utilities (model 4 - leg-level probability)
+# -----------------------------------------------------------------------------
+# These definitions intentionally override the earlier route-level helpers above.
+# The endpoint contract remains the same, but each itinerary now includes
+# leg_incident_probabilities with one probability per leg.
+
+ROUTE_RISK_NUMERIC_FEATURES = [
+    "travel_hour",
+    "leg_duration_sec",
+    "leg_distance_m",
+    "incidents_near_leg_100m_24h",
+    "incidents_near_leg_250m_24h",
+    "incidents_near_leg_500m_24h",
+    "incidents_near_leg_7d",
+    "theft_ratio_near_leg_7d",
+    "assault_ratio_near_leg_7d",
+    "night_ratio_near_leg_7d",
+    "avg_distance_incidents_m",
+    "max_segment_density",
+    "mode_exposure_factor",
+    "is_walk",
+    "is_car",
+    "is_public_transport",
+    "num_transfers_before_leg",
+    "leg_sequence_ratio",
+]
+
+ROUTE_RISK_CATEGORICAL_FEATURES = ["travel_day_of_week", "transport_mode"]
+
+
+def incident_probability_level(probability: float) -> str:
+    value = max(0.0, min(1.0, float(probability or 0)))
+    if value >= 0.75:
+        return "Very High"
+    if value >= 0.55:
+        return "High"
+    if value >= 0.30:
+        return "Medium"
+    return "Low"
+
+
+def estimate_leg_distance_m(points: list[list[float]]) -> float:
+    """Estimate leg distance in meters without external dependencies."""
+    clean_points = normalize_route_points(points)
+    if len(clean_points) < 2:
+        return 0.0
+
+    radius_m = 6371000.0
+    total = 0.0
+    for (lat1, lon1), (lat2, lon2) in zip(clean_points, clean_points[1:]):
+        phi1 = math.radians(lat1)
+        phi2 = math.radians(lat2)
+        delta_phi = math.radians(lat2 - lat1)
+        delta_lambda = math.radians(lon2 - lon1)
+        a = math.sin(delta_phi / 2.0) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(delta_lambda / 2.0) ** 2
+        c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+        total += radius_m * c
+    return float(total)
+
+
+def compute_leg_risk_features_from_db(
+    leg_wkt: str,
+    travel_hour: int,
+    travel_day_of_week: str,
+    transport_mode: str,
+    leg_duration_sec: float,
+    leg_distance_m: float,
+    num_transfers_before_leg: int,
+    leg_sequence_ratio: float,
+) -> dict[str, Any]:
+    rows = fetch_all_dict(
+        """
+        WITH leg AS (
+            SELECT ST_GeomFromText(%s, 4326) AS geom
+        ), incidents_24h AS (
+            SELECT i.*
+            FROM incidents_raw i, leg l
+            WHERE i.geom IS NOT NULL
+              AND i.incident_datetime >= NOW() - INTERVAL '24 hours'
+              AND ST_DWithin(i.geom::geography, l.geom::geography, 500)
+        ), incidents_7d AS (
+            SELECT i.*
+            FROM incidents_raw i, leg l
+            WHERE i.geom IS NOT NULL
+              AND i.incident_datetime >= NOW() - INTERVAL '7 days'
+              AND ST_DWithin(i.geom::geography, l.geom::geography, 500)
+        ), segments AS (
+            SELECT ST_LineSubstring(l.geom, gs::float8, LEAST((gs + 0.10)::float8, 1.0)) AS geom
+            FROM leg l, generate_series(0.0, 0.90, 0.10) AS gs
+        ), segment_counts AS (
+            SELECT COUNT(i.row_id) AS incident_count
+            FROM segments s
+            LEFT JOIN incidents_raw i
+              ON i.geom IS NOT NULL
+             AND i.incident_datetime >= NOW() - INTERVAL '24 hours'
+             AND ST_DWithin(i.geom::geography, s.geom::geography, 250)
+            GROUP BY s.geom
+        )
+        SELECT
+            %s::int AS travel_hour,
+            %s::text AS travel_day_of_week,
+            %s::text AS transport_mode,
+            %s::double precision AS leg_duration_sec,
+            %s::double precision AS leg_distance_m,
+            (SELECT COUNT(*) FROM incidents_24h i, leg l WHERE ST_DWithin(i.geom::geography, l.geom::geography, 100))::int AS incidents_near_leg_100m_24h,
+            (SELECT COUNT(*) FROM incidents_24h i, leg l WHERE ST_DWithin(i.geom::geography, l.geom::geography, 250))::int AS incidents_near_leg_250m_24h,
+            (SELECT COUNT(*) FROM incidents_24h)::int AS incidents_near_leg_500m_24h,
+            (SELECT COUNT(*) FROM incidents_7d)::int AS incidents_near_leg_7d,
+            COALESCE((SELECT AVG(CASE WHEN incident_category ILIKE '%%theft%%' OR incident_category ILIKE '%%larceny%%' THEN 1.0 ELSE 0.0 END) FROM incidents_7d), 0.0) AS theft_ratio_near_leg_7d,
+            COALESCE((SELECT AVG(CASE WHEN incident_category ILIKE '%%assault%%' THEN 1.0 ELSE 0.0 END) FROM incidents_7d), 0.0) AS assault_ratio_near_leg_7d,
+            COALESCE((SELECT AVG(CASE WHEN EXTRACT(HOUR FROM incident_datetime) >= 20 OR EXTRACT(HOUR FROM incident_datetime) <= 5 THEN 1.0 ELSE 0.0 END) FROM incidents_7d), 0.0) AS night_ratio_near_leg_7d,
+            COALESCE((SELECT AVG(ST_Distance(i.geom::geography, l.geom::geography)) FROM incidents_7d i, leg l), 9999.0) AS avg_distance_incidents_m,
+            COALESCE((SELECT MAX(incident_count)::double precision FROM segment_counts), 0.0) AS max_segment_density,
+            CASE WHEN %s::text = 'WALK' THEN 1.00 WHEN %s::text = 'PUBLIC_TRANSPORT' THEN 0.45 WHEN %s::text = 'CAR' THEN 0.18 ELSE 0.50 END AS mode_exposure_factor,
+            CASE WHEN %s::text = 'WALK' THEN 1.0 ELSE 0.0 END AS is_walk,
+            CASE WHEN %s::text = 'CAR' THEN 1.0 ELSE 0.0 END AS is_car,
+            CASE WHEN %s::text = 'PUBLIC_TRANSPORT' THEN 1.0 ELSE 0.0 END AS is_public_transport,
+            %s::int AS num_transfers_before_leg,
+            %s::double precision AS leg_sequence_ratio;
+        """,
+        (
+            leg_wkt,
+            travel_hour,
+            travel_day_of_week,
+            transport_mode,
+            leg_duration_sec,
+            leg_distance_m,
+            transport_mode,
+            transport_mode,
+            transport_mode,
+            transport_mode,
+            transport_mode,
+            transport_mode,
+            int(num_transfers_before_leg),
+            float(leg_sequence_ratio),
+        ),
+    )
+    if not rows:
+        raise RuntimeError("Could not compute leg risk features.")
+    return dict(rows[0])
+
+
+def heuristic_leg_incident_probability(features: dict[str, Any]) -> float:
+    count_250 = min(float(features.get("incidents_near_leg_250m_24h") or 0) / 8.0, 1.0)
+    count_7d = min(float(features.get("incidents_near_leg_7d") or 0) / 90.0, 1.0)
+    max_segment = min(float(features.get("max_segment_density") or 0) / 6.0, 1.0)
+    avg_distance = float(features.get("avg_distance_incidents_m") or 9999)
+    distance_pressure = 1.0 - min(avg_distance / 500.0, 1.0)
+    night = max(0.0, min(1.0, float(features.get("night_ratio_near_leg_7d") or 0)))
+    theft = max(0.0, min(1.0, float(features.get("theft_ratio_near_leg_7d") or 0)))
+    assault = max(0.0, min(1.0, float(features.get("assault_ratio_near_leg_7d") or 0)))
+    exposure = max(0.0, min(1.0, float(features.get("mode_exposure_factor") or 0)))
+    transfers = min(float(features.get("num_transfers_before_leg") or 0) / 3.0, 1.0)
+
+    try:
+        travel_hour = int(features.get("travel_hour") or 12)
+    except (TypeError, ValueError):
+        travel_hour = 12
+    if travel_hour >= 22 or travel_hour <= 5:
+        hour_pressure = 0.08
+    elif 18 <= travel_hour <= 21:
+        hour_pressure = 0.05
+    else:
+        hour_pressure = 0.02
+
+    base = (
+        0.27 * count_250
+        + 0.17 * count_7d
+        + 0.16 * max_segment
+        + 0.10 * distance_pressure
+        + 0.08 * night
+        + 0.06 * theft
+        + 0.07 * assault
+        + hour_pressure
+    )
+    multiplier = max(0.25, min(1.50, 0.60 + 0.75 * exposure + 0.08 * transfers))
+    return max(0.0, min(1.0, float(base * multiplier)))
+
+
+def predict_leg_incident_probability_from_features(features: dict[str, Any]) -> dict[str, Any]:
+    try:
+        import pandas as pd
+    except ImportError as exc:
+        raise RuntimeError("Missing ML dependency. Add pandas to requirements.txt.") from exc
+
+    model_source = None
+    model_runtime_type = None
+    try:
+        model, model_source = load_route_risk_model()
+        df = pd.DataFrame([features])
+        for column in ROUTE_RISK_NUMERIC_FEATURES:
+            if column not in df.columns:
+                df[column] = 0
+            df[column] = pd.to_numeric(df[column], errors="coerce").fillna(0)
+        df["avg_distance_incidents_m"] = pd.to_numeric(df.get("avg_distance_incidents_m"), errors="coerce").fillna(9999)
+        for column in ROUTE_RISK_CATEGORICAL_FEATURES:
+            if column not in df.columns:
+                df[column] = "UNKNOWN"
+            df[column] = df[column].fillna("UNKNOWN").astype(str)
+
+        if isinstance(model, dict) and model.get("model_type") == "RouteLegIncidentProbabilityClassifier":
+            pipeline = model["pipeline"]
+            feature_columns = model.get("feature_columns") or ROUTE_RISK_NUMERIC_FEATURES + ROUTE_RISK_CATEGORICAL_FEATURES
+            probability = float(pipeline.predict_proba(df[feature_columns])[:, 1][0])
+            model_runtime_type = model.get("model_type")
+        elif isinstance(model, dict) and model.get("model_type") == "RouteRiskRandomForestRegressor":
+            # Backward compatibility with previous route-score artifacts.
+            pipeline = model["pipeline"]
+            feature_columns = model.get("feature_columns") or ROUTE_RISK_NUMERIC_FEATURES + ROUTE_RISK_CATEGORICAL_FEATURES
+            probability = float(pipeline.predict(df[feature_columns])[0])
+            model_runtime_type = model.get("model_type")
+        else:
+            feature_columns = ROUTE_RISK_NUMERIC_FEATURES + ROUTE_RISK_CATEGORICAL_FEATURES
+            if hasattr(model, "predict_proba"):
+                probability = float(model.predict_proba(df[feature_columns])[:, 1][0])
+            else:
+                probability = float(model.predict(df[feature_columns])[0])
+            model_runtime_type = type(model).__name__
+        probability = max(0.0, min(1.0, probability))
+        fallback_used = False
+    except Exception as exc:
+        probability = heuristic_leg_incident_probability(features)
+        model_source = f"heuristic_fallback: {exc}"
+        model_runtime_type = "heuristic_leg_incident_probability"
+        fallback_used = True
+
+    return {
+        "leg_incident_probability": round(probability, 4),
+        "risk_level": incident_probability_level(probability),
+        "model_name": ROUTE_RISK_MODEL_NAME,
+        "model_source": model_source,
+        "model_runtime_type": model_runtime_type,
+        "fallback_used": fallback_used,
+    }
+
+
+def build_leg_risk_reason(features: dict[str, Any], transport_mode: str) -> str:
+    mode_text = {
+        "WALK": "walking exposure",
+        "CAR": "car exposure",
+        "PUBLIC_TRANSPORT": "public transport exposure",
+    }.get(transport_mode, "route exposure")
+
+    count_24h = int(features.get("incidents_near_leg_250m_24h") or 0)
+    count_7d = int(features.get("incidents_near_leg_7d") or 0)
+    if count_24h > 0:
+        return f"{mode_text}; {count_24h} recent incidents within 250m in the last 24h."
+    if count_7d > 0:
+        return f"{mode_text}; {count_7d} incidents within 500m in the last 7 days."
+    return f"{mode_text}; no recent nearby incidents found in the measured radius."
+
+
+def evaluate_route_leg_risk(
+    leg: dict[str, Any],
+    leg_index: int,
+    leg_count: int,
+    travel_hour: int,
+    travel_day_of_week: str,
+    public_legs_before: int,
+) -> dict[str, Any]:
+    encoded = ((leg.get("legGeometry") or {}).get("points") or "").strip()
+    points = normalize_route_points(decode_polyline(encoded)) if encoded else []
+    if not points:
+        from_point = leg.get("from") or {}
+        to_point = leg.get("to") or {}
+        points = normalize_route_points([
+            [from_point.get("lat"), from_point.get("lon")],
+            [to_point.get("lat"), to_point.get("lon")],
+        ])
+    leg_wkt = build_linestring_wkt(points)
+    transport_mode = classify_leg_transport_mode(leg.get("mode"))
+
+    try:
+        duration = float(leg.get("duration") or 0.0)
+    except (TypeError, ValueError):
+        duration = 0.0
+    if duration <= 0:
+        try:
+            start_ms = int(leg.get("startTime") or 0)
+            end_ms = int(leg.get("endTime") or 0)
+            duration = max(0.0, (end_ms - start_ms) / 1000.0)
+        except Exception:
+            duration = 0.0
+    leg_distance_m = estimate_leg_distance_m(points)
+    leg_sequence_ratio = float(leg_index / max(leg_count - 1, 1)) if leg_count > 1 else 0.0
+
+    features = compute_leg_risk_features_from_db(
+        leg_wkt=leg_wkt,
+        travel_hour=travel_hour,
+        travel_day_of_week=travel_day_of_week,
+        transport_mode=transport_mode,
+        leg_duration_sec=duration,
+        leg_distance_m=leg_distance_m,
+        num_transfers_before_leg=public_legs_before,
+        leg_sequence_ratio=leg_sequence_ratio,
+    )
+    prediction = predict_leg_incident_probability_from_features(features)
+    return {
+        "leg_index": leg_index,
+        "mode": leg.get("mode"),
+        "transport_mode": transport_mode,
+        "from": leg.get("from"),
+        "to": leg.get("to"),
+        "duration": leg.get("duration"),
+        "startTime": leg.get("startTime"),
+        "endTime": leg.get("endTime"),
+        "decoded_point_count": len(points),
+        "decoded_points": points,
+        "leg_distance_m": round(leg_distance_m, 2),
+        "leg_incident_probability": prediction["leg_incident_probability"],
+        "risk_level": prediction["risk_level"],
+        "reason": build_leg_risk_reason(features, transport_mode),
+        "features": features,
+        "model_name": prediction["model_name"],
+        "model_source": prediction["model_source"],
+        "model_runtime_type": prediction["model_runtime_type"],
+        "fallback_used": prediction["fallback_used"],
+    }
+
+
+def aggregate_leg_probabilities(leg_risks: list[dict[str, Any]]) -> float:
+    no_incident_probability = 1.0
+    for leg in leg_risks:
+        probability = max(0.0, min(1.0, float(leg.get("leg_incident_probability") or 0)))
+        no_incident_probability *= (1.0 - probability)
+    return max(0.0, min(1.0, 1.0 - no_incident_probability))
+
+
+def evaluate_route_itinerary_risk(
+    itinerary: dict[str, Any],
+    origin_lat: float | None = None,
+    origin_lon: float | None = None,
+    dest_lat: float | None = None,
+    dest_lon: float | None = None,
+    save: bool = True,
+) -> dict[str, Any]:
+    points, decoded_legs = decode_itinerary_points(itinerary)
+    start_time = itinerary.get("startTime")
+    if not start_time and itinerary.get("legs"):
+        start_time = (itinerary["legs"][0] or {}).get("startTime")
+    travel_dt = safe_epoch_ms_to_datetime(start_time)
+    travel_hour = int(travel_dt.hour)
+    travel_day_of_week = travel_dt.strftime("%A")
+
+    leg_risks: list[dict[str, Any]] = []
+    public_legs_seen = 0
+    legs = itinerary.get("legs") or []
+    for leg_index, leg in enumerate(legs):
+        risk = evaluate_route_leg_risk(
+            leg=leg,
+            leg_index=leg_index,
+            leg_count=len(legs),
+            travel_hour=travel_hour,
+            travel_day_of_week=travel_day_of_week,
+            public_legs_before=max(public_legs_seen - 1, 0),
+        )
+        leg_risks.append(risk)
+        if risk.get("transport_mode") == "PUBLIC_TRANSPORT":
+            public_legs_seen += 1
+
+    itinerary_probability = aggregate_leg_probabilities(leg_risks)
+    highest_leg = max(leg_risks, key=lambda row: float(row.get("leg_incident_probability") or 0), default=None)
+    safest_leg = min(leg_risks, key=lambda row: float(row.get("leg_incident_probability") or 0), default=None)
+    fallback_used = any(bool(row.get("fallback_used")) for row in leg_risks)
+    model_runtime_type = next((row.get("model_runtime_type") for row in leg_risks if row.get("model_runtime_type")), None)
+    model_source = next((row.get("model_source") for row in leg_risks if row.get("model_source")), None)
+
+    # Keep backward-compatible fields. save=true is intentionally not persisted for
+    # leg-level predictions unless a future schema adds a leg_predictions table.
+    return {
+        "route_id": None,
+        "route_feature_id": None,
+        "prediction_id": None,
+        "risk_score": round(itinerary_probability, 4),
+        "risk_level": incident_probability_level(itinerary_probability),
+        "itinerary_incident_probability": round(itinerary_probability, 4),
+        "model_name": ROUTE_RISK_MODEL_NAME,
+        "model_source": model_source,
+        "model_runtime_type": model_runtime_type,
+        "fallback_used": fallback_used,
+        "decoded_point_count": len(points),
+        "decoded_legs": decoded_legs,
+        "leg_incident_probabilities": leg_risks,
+        "highest_risk_leg": highest_leg,
+        "safest_leg": safest_leg,
+        "features": {
+            "leg_count": len(leg_risks),
+            "walk_leg_count": sum(1 for row in leg_risks if row.get("transport_mode") == "WALK"),
+            "car_leg_count": sum(1 for row in leg_risks if row.get("transport_mode") == "CAR"),
+            "public_transport_leg_count": sum(1 for row in leg_risks if row.get("transport_mode") == "PUBLIC_TRANSPORT"),
+        },
+    }
+
+
+def evaluate_itineraries_route_risk(payload: dict[str, Any]) -> dict[str, Any]:
+    itineraries = extract_itineraries_from_payload(payload)
+    save = bool(payload.get("save", True))
+    origin_lat = payload.get("origin_lat")
+    origin_lon = payload.get("origin_lon")
+    dest_lat = payload.get("dest_lat")
+    dest_lon = payload.get("dest_lon")
+
+    results: list[dict[str, Any]] = []
+    for index, itinerary in enumerate(itineraries):
+        item = evaluate_route_itinerary_risk(
+            itinerary,
+            origin_lat=origin_lat,
+            origin_lon=origin_lon,
+            dest_lat=dest_lat,
+            dest_lon=dest_lon,
+            save=save,
+        )
+        item["itinerary_index"] = index
+        item["itinerary_id"] = itinerary.get("itinerary_id") or itinerary.get("id") or f"itinerary_{index + 1}"
+        item["duration"] = itinerary.get("duration")
+        item["generalizedCost"] = itinerary.get("generalizedCost")
+        item["walkDistance"] = itinerary.get("walkDistance")
+        results.append(item)
+
+    sorted_results = sorted(results, key=lambda row: float(row.get("itinerary_incident_probability") or row.get("risk_score") or 0))
     return {
         "route_count": len(results),
         "routes": results,
