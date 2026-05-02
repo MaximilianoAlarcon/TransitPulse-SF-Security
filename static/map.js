@@ -1485,10 +1485,10 @@ function renderHotspots(payload) {
     const marker = L.circleMarker([lat, lon], {
       pane: 'hotspotNoisePane',
       radius: 5,
-      color: '#f8fafc',
+      color: '#0f172a',
       weight: 1.4,
       opacity: 0.92,
-      fillColor: '#cbd5e1',
+      fillColor: '#22d3ee',
       fillOpacity: 0.68
     }).bindPopup(hotspotNoisePopupHtml(properties));
 
