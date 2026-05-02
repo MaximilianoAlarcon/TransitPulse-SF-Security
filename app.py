@@ -397,178 +397,6 @@ def health():
     return jsonify({"status": "ok"})
 
 
-@app.route("/db-test")
-def db_test():
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT current_database(), version();")
-                database_name, version = cur.fetchone()
-
-        return jsonify(
-            {
-                "status": "ok",
-                "database": database_name,
-                "postgres_version": version,
-                "postgis_expected": True,
-            }
-        )
-    except Exception as exc:
-        return jsonify({"status": "error", "message": str(exc)}), 500
-
-
-@app.route("/init-db", methods=["POST"])
-def init_db():
-    sql_file = BASE_DIR / "db_structure.sql"
-    if not sql_file.exists():
-        return jsonify({"status": "error", "message": "db_structure.sql not found"}), 500
-
-    try:
-        execute_sql_file(DB_CONFIG, sql_file)
-        return jsonify(
-            {
-                "status": "ok",
-                "message": "Database structure created successfully",
-                "sql_file": sql_file.name,
-            }
-        )
-    except Exception as exc:
-        return jsonify({"status": "error", "message": str(exc)}), 500
-
-
-@app.route("/db-query", methods=["POST"])
-def db_query():
-    payload = request.get_json(silent=True) or {}
-    query = payload.get("query", "")
-
-    try:
-        result = execute_query(DB_CONFIG, query)
-        if result["has_result_set"]:
-            return jsonify(
-                {
-                    "status": "ok",
-                    "query": query,
-                    "result_type": "result_set",
-                    "columns": result["columns"],
-                    "rows": result["rows"],
-                    "row_count": result["row_count"],
-                    "status_message": result["status_message"],
-                }
-            )
-
-        return jsonify(
-            {
-                "status": "ok",
-                "query": query,
-                "result_type": "command",
-                "affected_rows": result["affected_rows"],
-                "status_message": result["status_message"],
-            }
-        )
-    except Exception as exc:
-        return jsonify({"status": "error", "message": str(exc), "query": query}), 500
-
-
-@app.route("/api/debug/export-source-csv")
-def api_debug_export_source_csv():
-    table = (request.args.get("table") or "").strip().lower()
-    limit = request.args.get("limit", type=int)
-    export_all = (request.args.get("all") or "true").strip().lower() in {"true", "1", "yes"}
-
-    allowed_tables = {
-        "forecast_training_series": {
-            "base_query": """
-                SELECT bucket_start, police_district, incident_category, total_incidents
-                FROM forecast_training_series
-                ORDER BY bucket_start DESC
-            """,
-            "filename": "forecast_training_series.csv",
-        },
-        "incident_counts_hourly": {
-            "base_query": """
-                SELECT bucket_start, police_district, incident_category, incident_subcategory,
-                       total_incidents, open_active_count, filed_online_count
-                FROM incident_counts_hourly
-                ORDER BY bucket_start DESC
-            """,
-            "filename": "incident_counts_hourly.csv",
-        },
-        "risk_features_hourly": {
-            "base_query": """
-                SELECT feature_timestamp, police_district, incident_category,
-                       incidents_last_1h, incidents_last_3h, incidents_last_6h,
-                       incidents_last_24h, incidents_last_7d,
-                       open_active_ratio_24h, filed_online_ratio_24h,
-                       avg_report_delay_minutes_24h
-                FROM risk_features_hourly
-                ORDER BY feature_timestamp DESC
-            """,
-            "filename": "risk_features_hourly.csv",
-        },
-    }
-
-    if table not in allowed_tables:
-        return jsonify(
-            {
-                "status": "error",
-                "message": "Invalid table. Use forecast_training_series, incident_counts_hourly, or risk_features_hourly.",
-            }
-        ), 400
-
-    config = allowed_tables[table]
-
-    if export_all:
-        rows = fetch_all_dict(config["base_query"])
-    else:
-        safe_limit = 200 if limit is None else max(1, min(limit, 50000))
-        rows = fetch_all_dict(f"{config['base_query']} LIMIT %s;", (safe_limit,))
-
-    csv_text = rows_to_csv(rows)
-    return build_csv_response(config["filename"], csv_text)
-
-
-@app.route("/api/debug/export-source-zip")
-def api_debug_export_source_zip():
-    limit = request.args.get("limit", type=int)
-    export_all = (request.args.get("all") or "true").strip().lower() in {"true", "1", "yes"}
-
-    table_configs = {
-        "forecast_training_series.csv": """
-            SELECT bucket_start, police_district, incident_category, total_incidents
-            FROM forecast_training_series
-            ORDER BY bucket_start DESC
-        """,
-        "incident_counts_hourly.csv": """
-            SELECT bucket_start, police_district, incident_category, incident_subcategory,
-                   total_incidents, open_active_count, filed_online_count
-            FROM incident_counts_hourly
-            ORDER BY bucket_start DESC
-        """,
-        "risk_features_hourly.csv": """
-            SELECT feature_timestamp, police_district, incident_category,
-                   incidents_last_1h, incidents_last_3h, incidents_last_6h,
-                   incidents_last_24h, incidents_last_7d,
-                   open_active_ratio_24h, filed_online_ratio_24h,
-                   avg_report_delay_minutes_24h
-            FROM risk_features_hourly
-            ORDER BY feature_timestamp DESC
-        """,
-    }
-
-    files: dict[str, str] = {}
-
-    for filename, base_query in table_configs.items():
-        if export_all:
-            rows = fetch_all_dict(base_query)
-        else:
-            safe_limit = 200 if limit is None else max(1, min(limit, 50000))
-            rows = fetch_all_dict(f"{base_query} LIMIT %s;", (safe_limit,))
-
-        files[filename] = rows_to_csv(rows)
-
-    return build_zip_response("source_tables_export.zip", files)
-
-
 @app.route("/api/dashboard/filters")
 def api_dashboard_filters():
     """
@@ -1003,12 +831,6 @@ def api_dashboard_forecast_training_summary():
     )
 
 
-
-
-
-
-
-
 SF_TZ = ZoneInfo("America/Los_Angeles")
 
 def parse_sf_target_timestamp(raw_value: str) -> datetime | None:
@@ -1053,7 +875,6 @@ def apply_projection_timestamp_to_rows(
         projected_rows.append(projected_row)
 
     return projected_rows
-
 
 
 @app.route("/admin/ml/volume/model-info", methods=["GET"])
@@ -1123,40 +944,6 @@ def admin_ml_volume_predict():
         )
     except Exception as exc:
         return jsonify({"status": "error", "message": str(exc)}), 500
-
-
-@app.route("/admin/etl/run", methods=["POST"])
-@require_admin_token
-def admin_etl_run():
-    payload = parse_admin_json_payload()
-    command_name = (payload.get("command") or "").strip()
-    extra_env = payload.get("env") or {}
-    timeout_seconds = parse_positive_int(
-        payload.get("timeout_seconds"),
-        default=min(ADMIN_ETL_MAX_TIMEOUT_SECONDS, 1800),
-        min_value=1,
-        max_value=ADMIN_ETL_MAX_TIMEOUT_SECONDS,
-    )
-
-    if not isinstance(extra_env, dict):
-        return jsonify({"status": "error", "message": "env must be a JSON object."}), 400
-
-    try:
-        result = run_allowed_admin_etl(
-            command_name=command_name,
-            extra_env=extra_env,
-            timeout_seconds=timeout_seconds,
-        )
-        return jsonify({"status": "ok", **result})
-    except RuntimeError as exc:
-        message = str(exc)
-        try:
-            details = json.loads(message)
-            return jsonify({"status": "error", "message": "ETL command failed.", "details": details}), 500
-        except Exception:
-            return jsonify({"status": "error", "message": message}), 500
-    except Exception as exc:
-        return jsonify({"status": "error", "message": str(exc)}), 400
 
 
 @app.route("/api/dashboard/ml-volume-polygons", methods=["GET"])
