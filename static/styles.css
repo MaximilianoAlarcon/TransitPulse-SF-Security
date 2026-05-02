@@ -347,6 +347,12 @@ body {
   opacity: 0.95;
 }
 
+
+/* Muted Leaflet basemap */
+.leaflet-tile {
+  filter: grayscale(50%) brightness(105%) saturate(60%) contrast(95%);
+}
+
 .leaflet-popup-content-wrapper,
 .leaflet-popup-tip {
   background: #0f172a;
@@ -881,3 +887,22 @@ body {
 .custom-select.is-open {
   z-index: 99999;
 }
+/* Footer signature */
+.built-by-signature {
+  font-size: 12px;
+  color: #888;
+  text-align: center;
+  padding: 6px 0;
+}
+
+.built-by-signature a {
+  color: #888;
+  text-decoration: none;
+}
+
+.built-by-signature a:hover,
+.built-by-signature a:focus-visible {
+  color: var(--accent);
+  text-decoration: none;
+}
+

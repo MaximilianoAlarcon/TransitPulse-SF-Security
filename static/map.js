@@ -1326,8 +1326,8 @@ function renderHotspotSummary(payload) {
         <span>${formatNumber(summary.cluster_count)} clusters from ${formatNumber(summary.source_points)} source incidents.</span>
       </div>
       <div class="roadmap-item">
-        <strong>Noise filtered out</strong>
-        <span>${formatNumber(summary.noise_points)} points did not form a dense spatial cluster.</span>
+        <strong>Isolated incidents</strong>
+        <span>${formatNumber(summary.noise_points)} incidents outside hotspot zones are shown as small context points.</span>
       </div>
       <div class="roadmap-item">
         <strong>Scope</strong>
@@ -1337,6 +1337,7 @@ function renderHotspotSummary(payload) {
         <span class="hotspot-legend-item"><span class="hotspot-legend-swatch" style="background:#ff6b6b"></span>High density</span>
         <span class="hotspot-legend-item"><span class="hotspot-legend-swatch" style="background:#f7b267"></span>Medium</span>
         <span class="hotspot-legend-item"><span class="hotspot-legend-swatch" style="background:#66c7f4"></span>Lower</span>
+        <span class="hotspot-legend-item"><span class="hotspot-legend-swatch" style="background:#cbd5e1"></span>Isolated incidents</span>
       </div>
     </div>
   `;
@@ -1355,13 +1356,60 @@ function renderHotspotSummary(payload) {
   }
 }
 
+function hotspotNoisePopupHtml(properties = {}) {
+  const dt = properties.incident_datetime
+    ? new Date(properties.incident_datetime).toLocaleString()
+    : 'Unknown date';
+
+  return `
+    <div class="popup-card hotspot-popup">
+      <strong>${properties.incident_category || 'Isolated incident'}</strong><br>
+      <span>${properties.incident_subcategory || 'Unknown subcategory'}</span><br>
+      <span>${properties.police_district || 'Unknown district'}</span><br>
+      <span>${properties.resolution || 'Unknown status'}</span><br>
+      <small>${dt}</small>
+    </div>
+  `;
+}
+
+function buildHotspotPolygonFeatureCollection(payload) {
+  const features = Array.isArray(payload?.features) ? payload.features : [];
+  const polygonFeatures = features.filter((feature) => {
+    const geometryType = feature?.geometry?.type;
+    return feature?.type === 'Feature' && (geometryType === 'Polygon' || geometryType === 'MultiPolygon');
+  });
+
+  return {
+    type: 'FeatureCollection',
+    features: polygonFeatures
+  };
+}
+
+function getHotspotNoiseFeatures(payload) {
+  return Array.isArray(payload?.noise_features)
+    ? payload.noise_features.filter((feature) => {
+        const coords = feature?.geometry?.coordinates;
+        return (
+          feature?.type === 'Feature' &&
+          feature?.geometry?.type === 'Point' &&
+          Array.isArray(coords) &&
+          Number.isFinite(Number(coords[0])) &&
+          Number.isFinite(Number(coords[1]))
+        );
+      })
+    : [];
+}
+
 function renderHotspots(payload) {
   clearMapLayers();
 
-  const featureCollection = buildCleanFeatureCollection(payload);
+  const featureCollection = buildHotspotPolygonFeatureCollection(payload);
   const features = featureCollection.features;
+  const noiseFeatures = getHotspotNoiseFeatures(payload);
+  const hotspotLayerGroup = L.layerGroup();
+  const validLatLngs = [];
 
-  appState.layers.hotspots = L.geoJSON(featureCollection, {
+  const polygonLayer = L.geoJSON(featureCollection, {
     renderer: L.svg(),
     style: (feature) => {
       const properties = feature?.properties || {};
@@ -1393,23 +1441,54 @@ function renderHotspots(payload) {
       });
 
       layer.on('mouseout', () => {
-        appState.layers.hotspots?.resetStyle(layer);
+        polygonLayer.resetStyle(layer);
       });
     }
-  }).addTo(appState.map);
+  });
+
+  polygonLayer.addTo(hotspotLayerGroup);
+
+  noiseFeatures.forEach((feature) => {
+    const [lon, lat] = feature.geometry.coordinates.map(Number);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
+
+    validLatLngs.push([lat, lon]);
+
+    const properties = feature.properties || {};
+    const marker = L.circleMarker([lat, lon], {
+      radius: 3.4,
+      color: '#cbd5e1',
+      weight: 1,
+      opacity: 0.52,
+      fillColor: '#cbd5e1',
+      fillOpacity: 0.30
+    }).bindPopup(hotspotNoisePopupHtml(properties));
+
+    marker.bindTooltip(`${properties.incident_category || 'Incident'} · isolated`, {
+      sticky: true,
+      direction: 'top',
+      opacity: 0.82
+    });
+
+    hotspotLayerGroup.addLayer(marker);
+  });
+
+  appState.layers.hotspots = hotspotLayerGroup.addTo(appState.map);
 
   if (features.length > 0) {
-    const bounds = appState.layers.hotspots.getBounds();
+    const bounds = polygonLayer.getBounds();
     if (bounds && bounds.isValid()) {
       appState.map.fitBounds(bounds.pad(0.08));
     }
+  } else if (validLatLngs.length > 0) {
+    appState.map.fitBounds(L.latLngBounds(validLatLngs).pad(0.08));
   } else if (payload?.center) {
     appState.map.setView([payload.center.lat, payload.center.lon], 12);
   }
 
   const caption = document.getElementById('map-caption');
   if (caption) {
-    caption.textContent = `Hotspot clustering · ${formatNumber(payload?.summary?.cluster_count || 0)} clusters · ${formatNumber(payload?.summary?.source_points || 0)} points analyzed`;
+    caption.textContent = `Hotspot clustering · ${formatNumber(payload?.summary?.cluster_count || 0)} clusters · ${formatNumber(payload?.summary?.noise_points || 0)} isolated · ${formatNumber(payload?.summary?.source_points || 0)} points analyzed`;
   }
 
   renderHotspotSummary(payload);
@@ -1465,33 +1544,21 @@ async function loadHotspots() {
     const clusterCount = payload?.summary?.cluster_count || 0;
     const sourcePoints = payload?.summary?.source_points || 0;
 
-    // 🔥 CASO 1: hay clusters → normal
-    if (clusterCount > 0) {
-      renderHotspots(payload);
-      updateStatus('Hotspots loaded');
-      updateHotspotStatus('Hotspot layer loaded.');
-      return;
-    }
-
-    // 🔥 CASO 2: no hay clusters pero sí puntos → fallback a puntos
+    // Case 1: clusters and/or isolated points are available.
     if (sourcePoints > 0) {
-      const pointPayload = await apiGet('/api/dashboard/map-points', {
-        ...params,
-        risk_mode: appState.filters.riskMode
-      });
+      renderHotspots(payload);
 
-      renderMap(pointPayload);
-
-      updateStatus('No hotspots detected');
-      const container = document.getElementById('hotspot-summary');
-      container.innerHTML = '';
-      updateHotspotStatus(
-        `No dense hotspots found. Showing ${sourcePoints} matching incidents instead.`
-      );
+      if (clusterCount > 0) {
+        updateStatus('Hotspots loaded');
+        updateHotspotStatus('Hotspot layer loaded with isolated incidents as context points.');
+      } else {
+        updateStatus('No dense hotspots detected');
+        updateHotspotStatus(`No dense hotspots found. Showing ${sourcePoints} isolated incidents instead.`);
+      }
       return;
     }
 
-    // 🔥 CASO 3: no hay nada
+    // Case 2: no incidents for selected scope.
     updateStatus('No data for selected filters');
     updateHotspotStatus(
       'No incidents found for the selected filters. Try a wider time window.'

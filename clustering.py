@@ -148,12 +148,12 @@ def _cluster_group(
     *,
     eps_meters: float,
     min_samples: int,
-) -> tuple[list[dict[str, Any]], int]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     if _IMPORT_ERROR is not None or np is None or DBSCAN is None:
         raise RuntimeError("Missing clustering dependencies. Add scikit-learn and numpy to requirements.txt.") from _IMPORT_ERROR
 
     if len(rows) < min_samples:
-        return [], len(rows)
+        return [], rows
 
     coordinates_radians = np.radians(
         [[_safe_float(row["latitude"]), _safe_float(row["longitude"])] for row in rows]
@@ -168,12 +168,12 @@ def _cluster_group(
     ).fit_predict(coordinates_radians)
 
     grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
-    noise_count = 0
+    noise_rows: list[dict[str, Any]] = []
 
     for row, raw_label in zip(rows, labels):
         label = int(raw_label)
         if label == -1:
-            noise_count += 1
+            noise_rows.append(row)
             continue
         grouped[label].append(row)
 
@@ -223,7 +223,7 @@ def _cluster_group(
         )
 
     clusters.sort(key=lambda item: (item["point_count"], item["density_score"]), reverse=True)
-    return clusters, noise_count
+    return clusters, noise_rows
 
 
 def build_hotspot_geojson(
@@ -266,15 +266,45 @@ def build_hotspot_geojson(
         rows_by_category[row.get("incident_category") or "Unknown"].append(row)
 
     features: list[dict[str, Any]] = []
-    noise_count_total = 0
+    noise_features: list[dict[str, Any]] = []
 
     for incident_category, category_rows in sorted(rows_by_category.items()):
-        clusters, noise_count = _cluster_group(
+        clusters, noise_rows = _cluster_group(
             category_rows,
             eps_meters=safe_eps,
             min_samples=safe_min_samples,
         )
-        noise_count_total += noise_count
+
+        for noise_index, noise_row in enumerate(noise_rows):
+            incident_dt = noise_row.get("incident_datetime")
+            noise_id = f"noise:{incident_category}:{noise_row.get('row_id') or noise_index}"
+            noise_features.append(
+                {
+                    "type": "Feature",
+                    "id": noise_id,
+                    "geometry": {
+                        "type": "Point",
+                        "coordinates": [
+                            round(_safe_float(noise_row.get("longitude")), 6),
+                            round(_safe_float(noise_row.get("latitude")), 6),
+                        ],
+                    },
+                    "properties": {
+                        "hotspot_id": noise_id,
+                        "incident_id": noise_row.get("row_id"),
+                        "incident_category": incident_category,
+                        "incident_subcategory": noise_row.get("incident_subcategory") or "Unknown",
+                        "incident_description": noise_row.get("incident_description") or "",
+                        "police_district": noise_row.get("police_district") or "Unknown",
+                        "resolution": noise_row.get("resolution") or "Unknown",
+                        "is_noise": True,
+                        "is_hotspot": False,
+                        "incident_datetime": incident_dt.isoformat() if incident_dt else None,
+                        "time_window_start": start_dt.isoformat(),
+                        "time_window_end": end_dt.isoformat(),
+                    },
+                }
+            )
 
         for cluster in clusters:
             hotspot_id = f"{incident_category}:{cluster['cluster_label']}"
@@ -331,13 +361,15 @@ def build_hotspot_geojson(
         "summary": {
             "source_points": len(rows),
             "cluster_count": len(features),
-            "noise_points": noise_count_total,
+            "noise_points": len(noise_features),
+            "isolated_points_visible": True,
             "eps_meters": safe_eps,
             "min_samples": safe_min_samples,
             "max_points": safe_max_points,
             "max_clusters": safe_max_clusters,
             "clustered_by": "incident_category",
         },
+        "noise_features": noise_features,
         "filters": {
             "district": district or "all",
             "category": category or "all",
