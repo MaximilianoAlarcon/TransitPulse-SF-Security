@@ -354,10 +354,13 @@ def build_hotspot_geojson(
     )
     features = features[:safe_max_clusters]
 
+    all_features = features + noise_features
+
     return {
         "status": "ok",
         "type": "FeatureCollection",
-        "features": features,
+        "features": all_features,
+        "cluster_features": features,
         "summary": {
             "source_points": len(rows),
             "cluster_count": len(features),

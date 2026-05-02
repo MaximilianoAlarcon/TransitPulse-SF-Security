@@ -76,6 +76,15 @@ function initMap() {
     attribution: '&copy; OpenStreetMap contributors'
   }).addTo(appState.map);
   L.control.zoom({ position: 'topright' }).addTo(appState.map);
+
+  // Dedicated pane for isolated hotspot incidents. This keeps the small
+  // context points above hotspot polygons and avoids the "data exists but is
+  // visually hidden" problem.
+  if (!appState.map.getPane('hotspotNoisePane')) {
+    appState.map.createPane('hotspotNoisePane');
+    appState.map.getPane('hotspotNoisePane').style.zIndex = 665;
+  }
+
   appState.layers.incidents = L.layerGroup().addTo(appState.map);
 }
 
@@ -1373,7 +1382,9 @@ function hotspotNoisePopupHtml(properties = {}) {
 }
 
 function buildHotspotPolygonFeatureCollection(payload) {
-  const features = Array.isArray(payload?.features) ? payload.features : [];
+  const features = Array.isArray(payload?.cluster_features)
+    ? payload.cluster_features
+    : (Array.isArray(payload?.features) ? payload.features : []);
   const polygonFeatures = features.filter((feature) => {
     const geometryType = feature?.geometry?.type;
     return feature?.type === 'Feature' && (geometryType === 'Polygon' || geometryType === 'MultiPolygon');
@@ -1386,18 +1397,34 @@ function buildHotspotPolygonFeatureCollection(payload) {
 }
 
 function getHotspotNoiseFeatures(payload) {
-  return Array.isArray(payload?.noise_features)
-    ? payload.noise_features.filter((feature) => {
-        const coords = feature?.geometry?.coordinates;
-        return (
-          feature?.type === 'Feature' &&
-          feature?.geometry?.type === 'Point' &&
-          Array.isArray(coords) &&
-          Number.isFinite(Number(coords[0])) &&
-          Number.isFinite(Number(coords[1]))
-        );
-      })
-    : [];
+  const candidates = [];
+
+  if (Array.isArray(payload?.noise_features)) {
+    candidates.push(...payload.noise_features);
+  }
+
+  // Defensive support: if the backend ever returns isolated points inside the
+  // main GeoJSON features array, render them too.
+  if (Array.isArray(payload?.features)) {
+    candidates.push(...payload.features.filter((feature) => feature?.properties?.is_noise === true));
+  }
+
+  const seen = new Set();
+  return candidates.filter((feature) => {
+    const coords = feature?.geometry?.coordinates;
+    const id = feature?.id || feature?.properties?.hotspot_id || JSON.stringify(coords || []);
+    const isValid = (
+      feature?.type === 'Feature' &&
+      feature?.geometry?.type === 'Point' &&
+      Array.isArray(coords) &&
+      Number.isFinite(Number(coords[0])) &&
+      Number.isFinite(Number(coords[1]))
+    );
+
+    if (!isValid || seen.has(id)) return false;
+    seen.add(id);
+    return true;
+  });
 }
 
 function renderHotspots(payload) {
@@ -1406,7 +1433,7 @@ function renderHotspots(payload) {
   const featureCollection = buildHotspotPolygonFeatureCollection(payload);
   const features = featureCollection.features;
   const noiseFeatures = getHotspotNoiseFeatures(payload);
-  const hotspotLayerGroup = L.layerGroup();
+  const hotspotLayerGroup = L.featureGroup();
   const validLatLngs = [];
 
   const polygonLayer = L.geoJSON(featureCollection, {
@@ -1456,12 +1483,13 @@ function renderHotspots(payload) {
 
     const properties = feature.properties || {};
     const marker = L.circleMarker([lat, lon], {
-      radius: 3.4,
-      color: '#cbd5e1',
-      weight: 1,
-      opacity: 0.52,
+      pane: 'hotspotNoisePane',
+      radius: 5,
+      color: '#f8fafc',
+      weight: 1.4,
+      opacity: 0.92,
       fillColor: '#cbd5e1',
-      fillOpacity: 0.30
+      fillOpacity: 0.68
     }).bindPopup(hotspotNoisePopupHtml(properties));
 
     marker.bindTooltip(`${properties.incident_category || 'Incident'} · isolated`, {
@@ -1475,11 +1503,12 @@ function renderHotspots(payload) {
 
   appState.layers.hotspots = hotspotLayerGroup.addTo(appState.map);
 
-  if (features.length > 0) {
-    const bounds = polygonLayer.getBounds();
-    if (bounds && bounds.isValid()) {
-      appState.map.fitBounds(bounds.pad(0.08));
-    }
+  // Fit the map to BOTH hotspot polygons and isolated incident markers.
+  // The previous version only fitted to polygon bounds when clusters existed,
+  // so isolated points could be correctly added but remain outside the viewport.
+  const allBounds = hotspotLayerGroup.getBounds();
+  if (allBounds && allBounds.isValid()) {
+    appState.map.fitBounds(allBounds.pad(0.08));
   } else if (validLatLngs.length > 0) {
     appState.map.fitBounds(L.latLngBounds(validLatLngs).pad(0.08));
   } else if (payload?.center) {
@@ -1548,12 +1577,17 @@ async function loadHotspots() {
     if (sourcePoints > 0) {
       renderHotspots(payload);
 
+      const isolatedCount = getHotspotNoiseFeatures(payload).length;
       if (clusterCount > 0) {
         updateStatus('Hotspots loaded');
-        updateHotspotStatus('Hotspot layer loaded with isolated incidents as context points.');
+        updateHotspotStatus(
+          isolatedCount > 0
+            ? `Hotspot layer loaded with ${isolatedCount} isolated incidents as context points.`
+            : 'Hotspot layer loaded. No isolated incident coordinates were returned by the backend.'
+        );
       } else {
         updateStatus('No dense hotspots detected');
-        updateHotspotStatus(`No dense hotspots found. Showing ${sourcePoints} isolated incidents instead.`);
+        updateHotspotStatus(`No dense hotspots found. Showing ${isolatedCount || sourcePoints} isolated incidents instead.`);
       }
       return;
     }
